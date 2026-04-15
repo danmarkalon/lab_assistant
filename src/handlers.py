@@ -1,0 +1,497 @@
+"""
+Telegram handlers — Phase 2 (Protocol Expert sessions).
+
+Conversation states:
+  PROTOCOL_SELECT   : user is choosing a protocol from the Drive list
+  AWAITING_OBJECTIVE: protocol chosen, waiting for session objective text
+  EXPERIMENT_ACTIVE : session in progress — all messages go through ProtocolSession
+  DEVIATION_ENTRY   : waiting for deviation description text
+  REFINE_ENTRY      : waiting for knowledge-refinement finding text
+  CONFIRM_END       : waiting for end-of-session findings (or 'no' to skip)
+
+Session state is stored in context.user_data['session'] (a ProtocolSession object).
+The protocol list shown to the user is stored in context.user_data['protocols'] so
+the CallbackQueryHandler can look up the selection by index.
+
+Outside an experiment session (IDLE), text/voice/photo are routed through the plain
+Phase-1-style handlers using per-user ConversationHistory objects.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from .claude_client import BASE_SYSTEM_PROMPT, ConversationHistory, send_message, send_message_with_image
+from .config import get_researcher_name
+from .google_client import list_protocols
+from .protocol_skill import ProtocolSession
+from .transcription import transcribe_ogg
+
+logger = logging.getLogger(__name__)
+
+# ── Conversation state constants ──────────────────────────────────────────────
+
+PROTOCOL_SELECT     = 0
+AWAITING_OBJECTIVE  = 1
+EXPERIMENT_ACTIVE   = 2
+DEVIATION_ENTRY     = 3
+REFINE_ENTRY        = 4
+CONFIRM_END         = 5
+
+# ── Per-user fallback histories (used outside experiment sessions) ─────────────
+
+_histories: dict[int, ConversationHistory] = {}
+
+
+def _get_history(user_id: int) -> ConversationHistory:
+    if user_id not in _histories:
+        _histories[user_id] = ConversationHistory()
+    return _histories[user_id]
+
+
+# ── /start and /help (always active, outside ConversationHandler) ─────────────
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    name = get_researcher_name(user_id)
+    keyboard = [
+        [InlineKeyboardButton("🧪 Start Experiment", callback_data="menu:start_experiment")],
+        [InlineKeyboardButton("📦 Stock Orders", callback_data="menu:stock")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
+    ]
+    await update.message.reply_text(
+        f"Hello, {name}! I'm your lab assistant 🔬\n\n"
+        "Use *Start Experiment* to load a protocol and begin a session.\n"
+        "Outside a session, just send me a message, voice, or photo for general assistance.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "*Lab Assistant — Command Reference*\n\n"
+        "*Session commands (use inside an experiment):*\n"
+        "/start\\_experiment — pick a protocol and begin a session\n"
+        "/buffer \\[name\\] — AI-assisted buffer preparation from protocol recipe\n"
+        "/deviation — log a deviation from the protocol\n"
+        "/calculate \\[query\\] — dilutions, molarity, unit conversions\n"
+        "/refine — add a knowledge note to the protocol's knowledge base\n"
+        "/note \\[text\\] — add an explicit timestamped note\n"
+        "/end — close the session and save to Google Drive\n"
+        "/cancel — abandon session without saving\n\n"
+        "*Outside a session:*\n"
+        "• Send any text → Claude lab assistant (no protocol context)\n"
+        "• Send a voice message → transcribed then answered\n"
+        "• Send a photo → Claude vision analysis\n\n"
+        "*Stock orders (Phase 4):*\n"
+        "/order\\_item · /view\\_orders · /mark\\_arrived",
+        parse_mode="Markdown",
+    )
+
+
+# ── Entry point: /start_experiment ───────────────────────────────────────────
+
+
+async def cmd_start_experiment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """List protocols from Drive and ask the user to pick one."""
+    await update.message.chat.send_action("typing")
+    try:
+        protocols = await list_protocols()
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Could not connect to Google Drive: {exc}\n\n"
+            "Please ensure GOOGLE_SERVICE_ACCOUNT_FILE and "
+            "DRIVE_PROTOCOLS_FOLDER_ID are set in .env."
+        )
+        return ConversationHandler.END
+
+    if not protocols:
+        await update.message.reply_text(
+            "No protocol .docx files found in the Protocols Drive folder.\n"
+            "Upload your protocols and try again."
+        )
+        return ConversationHandler.END
+
+    # Store the list so the callback handler can look up by index
+    context.user_data["protocols"] = protocols
+    keyboard = [
+        [InlineKeyboardButton(p["name"], callback_data=f"proto:{i}")]
+        for i, p in enumerate(protocols)
+    ]
+    await update.message.reply_text(
+        "Select a protocol to begin:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return PROTOCOL_SELECT
+
+
+# ── PROTOCOL_SELECT state ────────────────────────────────────────────────────
+
+
+async def select_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle protocol selection from the inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    idx = int(query.data.split(":")[1])
+    protocols: list = context.user_data.get("protocols", [])
+    if idx >= len(protocols):
+        await query.edit_message_text(
+            "Protocol not found. Use /start_experiment to try again."
+        )
+        return ConversationHandler.END
+
+    context.user_data["selected_protocol"] = protocols[idx]
+    await query.edit_message_text(
+        f"Protocol: *{protocols[idx]['name']}*\n\n"
+        "What is the objective or target for this session?",
+        parse_mode="Markdown",
+    )
+    return AWAITING_OBJECTIVE
+
+
+# ── AWAITING_OBJECTIVE state ─────────────────────────────────────────────────
+
+
+async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Create the ProtocolSession and transition to EXPERIMENT_ACTIVE."""
+    protocol = context.user_data["selected_protocol"]
+    user_id = update.effective_user.id
+    researcher = get_researcher_name(user_id)
+    objective = update.message.text.strip()
+
+    await update.message.reply_text(
+        f"⏳ Loading *{protocol['name']}* and knowledge base...",
+        parse_mode="Markdown",
+    )
+    await update.message.chat.send_action("typing")
+
+    try:
+        session = await ProtocolSession.create(
+            protocol=protocol,
+            researcher_name=researcher,
+            objective=objective,
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Failed to load protocol: {exc}\n\nUse /cancel to abort."
+        )
+        return AWAITING_OBJECTIVE
+
+    context.user_data["session"] = session
+
+    kb_text = (
+        "📚 Knowledge base: loaded ✅" if session.companion_doc_id
+        else "📚 Knowledge base: none yet (create a `_context` Google Doc to start one)"
+    )
+    await update.message.reply_text(
+        f"✅ *Protocol Expert loaded*\n"
+        f"Protocol: `{session.protocol_name}`\n"
+        f"Version: `{session.protocol_version}`\n"
+        f"{kb_text}\n\n"
+        f"You can now ask questions, send voice/photos, or use:\n"
+        f"/buffer · /deviation · /calculate · /refine · /note · /end",
+        parse_mode="Markdown",
+    )
+    return EXPERIMENT_ACTIVE
+
+
+# ── EXPERIMENT_ACTIVE state ───────────────────────────────────────────────────
+
+
+def _get_session(context: ContextTypes.DEFAULT_TYPE) -> ProtocolSession | None:
+    return context.user_data.get("session")
+
+
+async def active_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+    await update.message.chat.send_action("typing")
+    reply = await session.handle_message(update.message.text)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+async def active_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+    await update.message.chat.send_action("typing")
+
+    voice_file = await update.message.voice.get_file()
+    buf = io.BytesIO()
+    await voice_file.download_to_memory(buf)
+    transcript = await transcribe_ogg(buf.getvalue())
+
+    await update.message.reply_text(f"🎙️ _{transcript}_", parse_mode="Markdown")
+    reply = await session.handle_message(transcript)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+async def active_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+    await update.message.chat.send_action("typing")
+
+    photo_file = await update.message.photo[-1].get_file()
+    buf = io.BytesIO()
+    await photo_file.download_to_memory(buf)
+
+    caption = (
+        update.message.caption
+        or "Describe this lab image. Extract any text, labels, or measurements visible."
+    )
+    reply = await session.handle_message(caption, image_bytes=buf.getvalue())
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return EXPERIMENT_ACTIVE
+    buffer_name = " ".join(context.args) if context.args else "the buffer"
+    await update.message.chat.send_action("typing")
+    prompt = (
+        f"Buffer preparation request: {buffer_name}. "
+        "Find the recipe in the protocol. "
+        "Ask me for the target final volume, then calculate the exact volumes and weights needed."
+    )
+    reply = await session.handle_message(prompt)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+async def cmd_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    query = " ".join(context.args) if context.args else ""
+    await update.message.chat.send_action("typing")
+    prompt = f"Lab calculation: {query}" if query else "I need help with a lab calculation."
+    if session:
+        reply = await session.handle_message(prompt)
+    else:
+        history = _get_history(update.effective_user.id)
+        reply = await send_message(history, prompt)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    note = " ".join(context.args) if context.args else ""
+    if not note:
+        await update.message.reply_text(
+            "Include your note after /note, e.g.:\n"
+            "`/note centrifuge set to 9800 rpm instead of 10000`",
+            parse_mode="Markdown",
+        )
+        return EXPERIMENT_ACTIVE
+    await update.message.chat.send_action("typing")
+    if session:
+        reply = await session.handle_message(f"Please record this note: {note}")
+        await update.message.reply_text(f"📝 Note recorded:\n{reply}")
+    else:
+        await update.message.reply_text(f"📝 Note: {note}")
+    return EXPERIMENT_ACTIVE
+
+
+async def cmd_deviation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "📋 Describe the deviation from the standard protocol.\n\n"
+        "Include: which step was changed, what was done differently, and why (if known)."
+    )
+    return DEVIATION_ENTRY
+
+
+async def cmd_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "📝 What finding would you like to add to this protocol's knowledge base?\n\n"
+        "(Describe the insight, issue, or tip that would help future runs.)"
+    )
+    return REFINE_ENTRY
+
+
+async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "🔚 Closing session.\n\n"
+        "Any findings to save to this protocol's knowledge base?\n"
+        "Reply with your finding, or send *no* to skip.",
+        parse_mode="Markdown",
+    )
+    return CONFIRM_END
+
+
+# ── DEVIATION_ENTRY state ─────────────────────────────────────────────────────
+
+
+async def receive_deviation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+    await update.message.chat.send_action("typing")
+    reply = await session.handle_deviation(update.message.text)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+# ── REFINE_ENTRY state ────────────────────────────────────────────────────────
+
+
+async def receive_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+    await update.message.chat.send_action("typing")
+    reply = await session.handle_refine(update.message.text)
+    await update.message.reply_text(reply)
+    return EXPERIMENT_ACTIVE
+
+
+# ── CONFIRM_END state ─────────────────────────────────────────────────────────
+
+
+async def receive_end_findings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session = _get_session(context)
+    if not session:
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    await update.message.chat.send_action("typing")
+
+    # Save a knowledge note if user provided a finding
+    if text not in ("no", "skip", "none", "-"):
+        refine_reply = await session.handle_refine(update.message.text)
+        await update.message.reply_text(refine_reply)
+
+    await update.message.reply_text("⏳ Generating session summary and saving to Drive...")
+
+    try:
+        summary, doc_url = await session.end_session()
+        # Truncate summary for Telegram (max message length)
+        display = summary[:1800] + ("..." if len(summary) > 1800 else "")
+        await update.message.reply_text(
+            f"✅ *Session closed.*\n\n"
+            f"📄 [Open session report]({doc_url})\n"
+            f"📊 Added to Lab Journal sheet\n\n"
+            f"*Summary:*\n{display}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("end_session failed: %s", exc)
+        await update.message.reply_text(
+            f"Session ended.\n"
+            f"⚠️ Could not save to Google Drive: {exc}\n\n"
+            "Please ensure Google API credentials are configured in .env."
+        )
+
+    context.user_data.pop("session", None)
+    context.user_data.pop("protocols", None)
+    context.user_data.pop("selected_protocol", None)
+    return ConversationHandler.END
+
+
+# ── cancel fallback ───────────────────────────────────────────────────────────
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("session", None)
+    context.user_data.pop("protocols", None)
+    context.user_data.pop("selected_protocol", None)
+    await update.message.reply_text(
+        "Session cancelled. Use /start_experiment to begin a new session."
+    )
+    return ConversationHandler.END
+
+
+# ── Fallback plain handlers (outside experiment sessions) ─────────────────────
+
+
+async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    history = _get_history(update.effective_user.id)
+    await update.message.chat.send_action("typing")
+    reply = await send_message(history, update.message.text)
+    await update.message.reply_text(reply)
+
+
+async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.chat.send_action("typing")
+    voice_file = await update.message.voice.get_file()
+    buf = io.BytesIO()
+    await voice_file.download_to_memory(buf)
+    transcript = await transcribe_ogg(buf.getvalue())
+    await update.message.reply_text(f"🎙️ _{transcript}_", parse_mode="Markdown")
+    history = _get_history(update.effective_user.id)
+    reply = await send_message(history, transcript)
+    await update.message.reply_text(reply)
+
+
+async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.chat.send_action("typing")
+    photo_file = await update.message.photo[-1].get_file()
+    buf = io.BytesIO()
+    await photo_file.download_to_memory(buf)
+    caption = (
+        update.message.caption
+        or "Describe this lab image. Extract any text, labels, or measurements visible."
+    )
+    history = _get_history(update.effective_user.id)
+    reply = await send_message_with_image(history, buf.getvalue(), caption)
+    await update.message.reply_text(reply)
+
+
+# ── ConversationHandler factory ───────────────────────────────────────────────
+
+
+def build_conversation_handler() -> ConversationHandler:
+    """Build and return the experiment session ConversationHandler."""
+    return ConversationHandler(
+        entry_points=[CommandHandler("start_experiment", cmd_start_experiment)],
+        states={
+            PROTOCOL_SELECT: [
+                CallbackQueryHandler(select_protocol, pattern=r"^proto:\d+$"),
+            ],
+            AWAITING_OBJECTIVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_objective),
+            ],
+            EXPERIMENT_ACTIVE: [
+                CommandHandler("buffer", cmd_buffer),
+                CommandHandler("calculate", cmd_calculate),
+                CommandHandler("note", cmd_note),
+                CommandHandler("deviation", cmd_deviation),
+                CommandHandler("refine", cmd_refine),
+                CommandHandler("end", cmd_end),
+                MessageHandler(filters.VOICE, active_voice),
+                MessageHandler(filters.PHOTO, active_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, active_text),
+            ],
+            DEVIATION_ENTRY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_deviation),
+            ],
+            REFINE_ENTRY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_refine),
+            ],
+            CONFIRM_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_end_findings),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        allow_reentry=True,
+    )

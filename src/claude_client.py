@@ -167,3 +167,22 @@ async def send_message_with_image(
     reply: str = response.content[0].text
     history.add_assistant(reply)
     return reply
+
+
+async def call_claude(
+    messages: list[dict],
+    system_prompt: str,
+    max_tokens: int = 1024,
+) -> str:
+    """Make a standalone Claude call with explicit messages — no history update.
+
+    Used for one-off calls such as generating summaries or drafting knowledge
+    notes, where polluting the session history would be undesirable.
+    """
+    response = await _client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=messages,
+    )
+    return response.content[0].text.strip()
