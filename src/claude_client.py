@@ -19,11 +19,12 @@ import base64
 import logging
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
-genai.configure(api_key=GEMINI_API_KEY)
+_client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
 # ── Base system prompt ────────────────────────────────────────────────────────
@@ -112,12 +113,11 @@ def build_system_prompt(
 # ── Internal helper ───────────────────────────────────────────────────────────
 
 
-def _make_model(system_prompt: str, max_tokens: int) -> genai.GenerativeModel:
-    """Create a Gemini model instance with the given system prompt."""
-    return genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
+def _make_config(system_prompt: str, max_tokens: int) -> genai_types.GenerateContentConfig:
+    """Build a GenerateContentConfig with system prompt and token limit."""
+    return genai_types.GenerateContentConfig(
         system_instruction=system_prompt,
-        generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+        max_output_tokens=max_tokens,
     )
 
 
@@ -132,8 +132,10 @@ async def send_message(
 ) -> str:
     """Send a text message, update history, and return Gemini's reply."""
     history.add_user(user_text)
-    model = _make_model(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    response = await model.generate_content_async(contents=history.messages)
+    cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
+    response = await _client.aio.models.generate_content(
+        model=GEMINI_MODEL, contents=history.messages, config=cfg
+    )
     reply: str = response.text
     history.add_assistant(reply)
     return reply
@@ -158,8 +160,10 @@ async def send_message_with_image(
         {"text": user_text},
     ]
     history.add_user(parts)
-    model = _make_model(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    response = await model.generate_content_async(contents=history.messages)
+    cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
+    response = await _client.aio.models.generate_content(
+        model=GEMINI_MODEL, contents=history.messages, config=cfg
+    )
     reply: str = response.text
     history.add_assistant(reply)
     return reply
@@ -187,6 +191,8 @@ async def call_claude(
                 {"role": role, "parts": [{"text": msg.get("content", "")}]}
             )
 
-    model = _make_model(system_prompt, max_tokens)
-    response = await model.generate_content_async(contents=gemini_messages)
+    cfg = _make_config(system_prompt, max_tokens)
+    response = await _client.aio.models.generate_content(
+        model=GEMINI_MODEL, contents=gemini_messages, config=cfg
+    )
     return response.text.strip()

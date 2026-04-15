@@ -75,44 +75,22 @@ def ensure_experiments_folder(drive) -> str:
 
 
 def create_lab_sheets(drive, sheets) -> str:
-    # Check if it already exists
-    q = (
-        f"'{DRIVE_ROOT_FOLDER_ID}' in parents"
-        " and mimeType='application/vnd.google-apps.spreadsheet'"
-        " and name='Lab Assistant'"
-        " and trashed=false"
-    )
-    res = drive.files().list(q=q, fields="files(id)").execute()
-    existing = res.get("files", [])
-    if existing:
-        spreadsheet_id = existing[0]["id"]
-        print(f"✅  'Lab Assistant' spreadsheet already exists  (id={spreadsheet_id})")
-        return spreadsheet_id
+    import os
+    spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
 
-    # Create the spreadsheet
-    spreadsheet = sheets.spreadsheets().create(
-        body={
-            "properties": {"title": "Lab Assistant"},
-            "sheets": [
-                {"properties": {"title": SHEET_LAB_JOURNAL,  "index": 0}},
-                {"properties": {"title": SHEET_STOCK_ORDERS, "index": 1}},
-                {"properties": {"title": SHEET_RECEIVED,     "index": 2}},
-            ],
-        }
-    ).execute()
-    spreadsheet_id = spreadsheet["spreadsheetId"]
-    print(f"✅  Created 'Lab Assistant' spreadsheet  (id={spreadsheet_id})")
+    if not spreadsheet_id:
+        print("\n⚠️   SHEETS_SPREADSHEET_ID is not set in .env.")
+        print("    Please do the following manually:")
+        print("    1. Go to sheets.google.com → create a blank spreadsheet")
+        print("    2. Name it 'Lab Assistant'")
+        print("    3. Create 3 tabs: 'Lab Journal', 'Stock Orders', 'Received Supplies'")
+        print("    4. Share it with: lab-assistant@oneylab-assistnant.iam.gserviceaccount.com (Editor)")
+        print("    5. Copy the ID from the URL: docs.google.com/spreadsheets/d/<ID>/edit")
+        print("    6. Add to .env:  SHEETS_SPREADSHEET_ID=<ID>")
+        print("    7. Re-run:  HTTPLIB2_CA_CERTS=/etc/ssl/certs/ca-certificates.crt python3 setup.py\n")
+        sys.exit(0)
 
-    # Move it into the root Drive folder
-    file = drive.files().get(fileId=spreadsheet_id, fields="parents").execute()
-    previous_parents = ",".join(file.get("parents", []))
-    drive.files().update(
-        fileId=spreadsheet_id,
-        addParents=DRIVE_ROOT_FOLDER_ID,
-        removeParents=previous_parents,
-        fields="id, parents",
-    ).execute()
-    print(f"   Moved to Lab Assistant Drive folder.")
+    print(f"✅  Using spreadsheet  (id={spreadsheet_id})")
 
     # Write headers
     headers = {

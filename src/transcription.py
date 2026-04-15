@@ -11,11 +11,12 @@ Supports any spoken language; Gemini auto-detects and transcribes faithfully.
 import base64
 import logging
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
-genai.configure(api_key=GEMINI_API_KEY)
+_client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
 
@@ -28,27 +29,25 @@ async def transcribe_ogg(ogg_bytes: bytes) -> str:
     Returns:
         Transcript string, stripped of leading/trailing whitespace.
     """
-    model = genai.GenerativeModel(model_name=GEMINI_MODEL)
-    audio_part = {
-        "inline_data": {
-            "mime_type": "audio/ogg",
-            "data": base64.b64encode(ogg_bytes).decode("utf-8"),
-        }
-    }
-    response = await model.generate_content_async(
+    audio_part = genai_types.Part(
+        inline_data=genai_types.Blob(
+            mime_type="audio/ogg",
+            data=base64.b64encode(ogg_bytes).decode("utf-8"),
+        )
+    )
+    response = await _client.aio.models.generate_content(
+        model=GEMINI_MODEL,
         contents=[
-            {
-                "role": "user",
-                "parts": [
+            genai_types.Content(
+                role="user",
+                parts=[
                     audio_part,
-                    {
-                        "text": (
-                            "Transcribe this audio accurately. "
-                            "Output only the transcribed text, nothing else."
-                        )
-                    },
+                    genai_types.Part(text=(
+                        "Transcribe this audio accurately. "
+                        "Output only the transcribed text, nothing else."
+                    )),
                 ],
-            }
-        ]
+            )
+        ],
     )
     return response.text.strip()

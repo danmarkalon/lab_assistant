@@ -15,11 +15,26 @@ Or from a Jupyter notebook (nest_asyncio handles the running event loop):
 """
 
 import logging
+import os
 
 import nest_asyncio
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from .config import TELEGRAM_BOT_TOKEN
+
+
+def _patch_ssl() -> None:
+    """Point certifi (used by httpx) at the system CA bundle when running behind
+    a corporate proxy that injects a self-signed cert into TLS chains."""
+    ca_bundle = os.environ.get("HTTPLIB2_CA_CERTS") or os.environ.get("SSL_CERT_FILE")
+    if ca_bundle:
+        try:
+            import certifi
+            certifi.where = lambda: ca_bundle  # type: ignore[method-assign]
+        except ImportError:
+            pass
+
+
 from .handlers import (
     build_conversation_handler,
     cmd_calculate,
@@ -41,6 +56,10 @@ def build_app():
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        # Increased timeouts for corporate proxies with high TLS overhead
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
         # concurrent_updates=False is required when using ConversationHandler
         .concurrent_updates(False)
         .build()
@@ -64,6 +83,7 @@ def build_app():
 
 def run() -> None:
     """Start the bot. Works from the command line and from a Jupyter notebook."""
+    _patch_ssl()
     nest_asyncio.apply()
     app = build_app()
     logger.info("Lab Assistant Phase 2 starting — polling for updates...")

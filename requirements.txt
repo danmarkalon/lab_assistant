@@ -3,7 +3,7 @@ python-telegram-bot==20.*
 nest_asyncio
 
 # AI — Gemini handles LLM, vision, and audio transcription (one API key)
-google-generativeai
+google-genai
 
 # Google APIs (Drive, Sheets, Docs — service account)
 google-auth
