@@ -83,6 +83,7 @@ class ProtocolSession:
         researcher_name: str,
         objective: str,
         system_prompt: str,
+        protocol_folder_id: str = "",
     ) -> None:
         self.protocol_name = protocol_name
         self.protocol_version = protocol_version
@@ -90,6 +91,7 @@ class ProtocolSession:
         self.researcher_name = researcher_name
         self.objective = objective
         self.system_prompt = system_prompt
+        self.protocol_folder_id = protocol_folder_id
         self.history = ConversationHistory()
         self.session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -116,9 +118,10 @@ class ProtocolSession:
             companion_doc_id,
         ) = await load_protocol(
             file_id=protocol["id"],
-            file_name=protocol["name"],
+            file_name=protocol["docx_name"],
             modified_time=protocol.get("modifiedTime", ""),
-            parent_folder_id=(protocol.get("parents") or [""])[0],
+            parent_folder_id=protocol.get("folder_id", ""),
+            is_gdoc=protocol.get("is_gdoc", False),
         )
 
         system_prompt = build_system_prompt(
@@ -135,6 +138,7 @@ class ProtocolSession:
             researcher_name=researcher_name,
             objective=objective,
             system_prompt=system_prompt,
+            protocol_folder_id=protocol.get("folder_id", ""),
         )
 
     # ── Message routing ───────────────────────────────────────────────────────
@@ -221,7 +225,7 @@ class ProtocolSession:
         doc_title = (
             f"{self.protocol_name} — {self.session_date} — {self.researcher_name}"
         )
-        doc_id = await create_session_doc(doc_title)
+        doc_id = await create_session_doc(doc_title, self.protocol_folder_id)
 
         report = (
             f"Protocol: {self.protocol_name}\n"

@@ -57,32 +57,24 @@ async def load_protocol(
     file_name: str,
     modified_time: str,
     parent_folder_id: str = "",
+    is_gdoc: bool = False,
 ) -> tuple[str, str, str, str, Optional[str]]:
     """Load a protocol from Drive and return all components for the skill.
 
-    Args:
-        file_id:       Google Drive file ID of the .docx protocol.
-        file_name:     Display name (e.g. "Western_Blot_v3.docx").
-        modified_time: Drive modifiedTime string (ISO 8601).
-
-    Returns:
-        (protocol_text, companion_text, protocol_name, protocol_version, companion_doc_id)
-
-        protocol_text:    Full extracted text from the .docx.
-        companion_text:   Text from the companion knowledge Google Doc (empty str if none).
-        protocol_name:    Filename without extension (e.g. "Western_Blot_v3").
-        protocol_version: Filename + last-modified date for traceability.
-        companion_doc_id: Google Doc id of the companion doc, or None.
+    Supports both .docx files and native Google Docs.
     """
     protocol_name = os.path.splitext(file_name)[0]
-    # Use only the date part (YYYY-MM-DD) of the ISO 8601 modifiedTime
     mod_date = modified_time[:10] if modified_time else "unknown"
     protocol_version = f"{file_name} (modified {mod_date})"
 
-    # Download and parse .docx
-    docx_bytes = await download_docx(file_id)
-    protocol_text = extract_docx_text(docx_bytes)
-    logger.info("Loaded protocol '%s' (%d chars)", protocol_name, len(protocol_text))
+    # Download and extract text
+    if is_gdoc:
+        protocol_text = await get_doc_text(file_id)
+        logger.info("Loaded Google Doc protocol '%s' (%d chars)", protocol_name, len(protocol_text))
+    else:
+        docx_bytes = await download_docx(file_id)
+        protocol_text = extract_docx_text(docx_bytes)
+        logger.info("Loaded protocol '%s' (%d chars)", protocol_name, len(protocol_text))
 
     # Load companion knowledge doc if it exists
     companion_text = ""

@@ -4,11 +4,13 @@ Google API client — Drive, Sheets, Docs.
 Drive folder layout expected:
   Lab Assistant/                  ← DRIVE_ROOT_FOLDER_ID
   ├── Cell Fractionation/         ← one subfolder per protocol
-  │   ├── protocol.docx           ← the protocol file
-  │   └── protocol_context        ← optional companion knowledge Google Doc
+  │   ├── protocol.docx           ← the protocol file (first .docx found)
+  │   ├── protocol_context        ← optional companion knowledge Google Doc
+  │   └── experiments/            ← auto-created; one session doc per run
+  │       └── YYYY-MM-DD — Protocol — Researcher
   ├── Another Protocol/
   │   └── ...
-  └── experiments/                ← created by setup.py; session reports go here
+  └── Lab Assistant (Sheets)      ← general experiment tracking
 
 Authentication: Google Service Account (headless — no browser OAuth).
 All public functions are async (sync Google API wrapped in run_in_executor).
@@ -65,32 +67,93 @@ async def _run(func, *args, **kwargs):
 # ── Drive — protocol discovery ────────────────────────────────────────────────
 
 
-def _list_docx_sync() -> list[dict]:
-    """Find all .docx files accessible to the service account.
+def _list_protocol_folders_sync() -> list[dict]:
+    """List protocol folders (direct subfolders of root, excluding Sheets files).
 
-    Returns each file with its parent folder id so the companion doc
-    can be searched in the same subfolder later.
+    For each subfolder, finds the first .docx OR Google Doc inside it.
+    Returns only folders that contain at least one protocol file.
+
+    Each item: {
+        "folder_id": str,    # the protocol subfolder ID
+        "name": str,         # folder name shown in the menu
+        "id": str,           # file ID (for download/read)
+        "docx_name": str,    # filename (or Google Doc title)
+        "modifiedTime": str, # file modifiedTime
+        "is_gdoc": bool,     # True if native Google Doc (read via Docs API)
+    }
     """
     svc = _get_service("drive", "v3")
+
+    # List direct subfolders of root
     q = (
-        "mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'"
+        f"'{DRIVE_ROOT_FOLDER_ID}' in parents"
+        " and mimeType='application/vnd.google-apps.folder'"
         " and trashed=false"
     )
-    result = svc.files().list(
-        q=q,
-        fields="files(id, name, modifiedTime, parents)",
-        orderBy="name",
-    ).execute()
-    return result.get("files", [])
+    result = svc.files().list(q=q, fields="files(id, name)", orderBy="name").execute()
+    folders = result.get("files", [])
+
+    protocols = []
+    for folder in folders:
+        # Try .docx first, then fall back to Google Doc
+        docx_q = (
+            f"'{folder['id']}' in parents"
+            " and mimeType='application/vnd.openxmlformats-officedocument"
+            ".wordprocessingml.document'"
+            " and trashed=false"
+        )
+        docx_res = svc.files().list(
+            q=docx_q,
+            fields="files(id, name, modifiedTime)",
+            orderBy="name",
+            pageSize=1,
+        ).execute()
+        docx_files = docx_res.get("files", [])
+
+        if docx_files:
+            f = docx_files[0]
+            protocols.append({
+                "folder_id": folder["id"],
+                "name": folder["name"],
+                "id": f["id"],
+                "docx_name": f["name"],
+                "modifiedTime": f.get("modifiedTime", ""),
+                "is_gdoc": False,
+            })
+        else:
+            # Fall back to native Google Doc
+            gdoc_q = (
+                f"'{folder['id']}' in parents"
+                " and mimeType='application/vnd.google-apps.document'"
+                " and trashed=false"
+            )
+            gdoc_res = svc.files().list(
+                q=gdoc_q,
+                fields="files(id, name, modifiedTime)",
+                orderBy="name",
+                pageSize=1,
+            ).execute()
+            gdoc_files = gdoc_res.get("files", [])
+            if gdoc_files:
+                f = gdoc_files[0]
+                protocols.append({
+                    "folder_id": folder["id"],
+                    "name": folder["name"],
+                    "id": f["id"],
+                    "docx_name": f["name"],
+                    "modifiedTime": f.get("modifiedTime", ""),
+                    "is_gdoc": True,
+                })
+
+    return protocols
 
 
 async def list_protocols() -> list[dict]:
-    """Return all .docx protocol files the service account can see.
+    """Return all protocol folders that contain a .docx file.
 
-    Each item: {"id": str, "name": str, "modifiedTime": str, "parents": list[str]}
-    The first element of "parents" is the subfolder the file lives in.
+    Each item: {"folder_id", "name", "id" (docx), "docx_name", "modifiedTime"}
     """
-    return await _run(_list_docx_sync)
+    return await _run(_list_protocol_folders_sync)
 
 
 def _download_file_sync(file_id: str) -> bytes:
@@ -164,10 +227,10 @@ def _get_or_create_subfolder_sync(parent_id: str, name: str) -> str:
     return folder["id"]
 
 
-async def get_or_create_experiments_folder() -> str:
-    """Return the id of the 'experiments' subfolder, creating it if needed."""
+async def get_or_create_experiments_folder(protocol_folder_id: str) -> str:
+    """Return the id of the 'experiments' subfolder inside a protocol folder."""
     return await _run(
-        _get_or_create_subfolder_sync, DRIVE_ROOT_FOLDER_ID, DRIVE_EXPERIMENTS_SUBFOLDER
+        _get_or_create_subfolder_sync, protocol_folder_id, DRIVE_EXPERIMENTS_SUBFOLDER
     )
 
 
@@ -236,9 +299,9 @@ def _create_doc_sync(title: str, folder_id: str) -> str:
     return file["id"]
 
 
-async def create_session_doc(title: str) -> str:
-    """Create a session report Google Doc inside the 'experiments' subfolder."""
-    experiments_folder_id = await get_or_create_experiments_folder()
+async def create_session_doc(title: str, protocol_folder_id: str) -> str:
+    """Create a session report Google Doc inside the protocol's 'experiments' subfolder."""
+    experiments_folder_id = await get_or_create_experiments_folder(protocol_folder_id)
     return await _run(_create_doc_sync, title, experiments_folder_id)
 
 
