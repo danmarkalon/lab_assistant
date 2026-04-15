@@ -89,10 +89,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     await update.message.reply_text(
         f"Hello, {name}! I'm your lab assistant 🔬\n\n"
-        "Use *Start Experiment* to load a protocol and begin a session.\n"
+        "Tap <b>Start Experiment</b> to load a protocol and begin a session.\n"
         "Outside a session, just send me a message, voice, or photo for general assistance.",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
