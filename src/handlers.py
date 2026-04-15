@@ -22,7 +22,7 @@ from __future__ import annotations
 import io
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -58,6 +58,22 @@ def _get_history(user_id: int) -> ConversationHistory:
     if user_id not in _histories:
         _histories[user_id] = ConversationHistory()
     return _histories[user_id]
+
+
+# ── Session reply keyboard ────────────────────────────────────────────────────
+
+
+def _session_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent button bar shown during active experiment sessions."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            ["🔬 Buffer", "🧮 Calculate"],
+            ["📋 Deviation", "📝 Note"],
+            ["📚 Refine", "🔚 End Session"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
 # ── /start and /help (always active, outside ConversationHandler) ─────────────
@@ -100,6 +116,64 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/order\\_item · /view\\_orders · /mark\\_arrived",
         parse_mode="Markdown",
     )
+
+
+# ── /start menu callback handler ─────────────────────────────────────────────
+
+
+async def handle_menu_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle taps from the inline keyboard shown by /start."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "start_experiment":
+        await query.edit_message_text("⏳ Loading protocols from Drive...")
+        try:
+            protocols = await list_protocols()
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ Could not connect to Google Drive: {exc}")
+            return ConversationHandler.END
+        if not protocols:
+            await query.edit_message_text(
+                "No protocol .docx files found in the Drive folder.\n"
+                "Upload your protocols and try again."
+            )
+            return ConversationHandler.END
+        context.user_data["protocols"] = protocols
+        keyboard = [
+            [InlineKeyboardButton(p["name"], callback_data=f"proto:{i}")]
+            for i, p in enumerate(protocols)
+        ]
+        await query.edit_message_text(
+            "Select a protocol to begin:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return PROTOCOL_SELECT
+
+    elif action == "help":
+        await query.edit_message_text(
+            "*Lab Assistant — Commands*\n\n"
+            "*Session button bar:*\n"
+            "🔬 Buffer — guided buffer prep from protocol recipe\n"
+            "🧮 Calculate — dilutions, molarity, unit conversions\n"
+            "📋 Deviation — log a protocol deviation\n"
+            "📝 Note — add a timestamped note\n"
+            "📚 Refine — add a finding to the knowledge base\n"
+            "🔚 End Session — close session and save to Drive\n\n"
+            "*Outside a session:*\n"
+            "Send text, voice, or a photo for general lab AI assistance.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    elif action == "stock":
+        await query.edit_message_text("📦 Stock order management is coming in the next phase.")
+        return ConversationHandler.END
+
+    return ConversationHandler.END
 
 
 # ── Entry point: /start_experiment ───────────────────────────────────────────
@@ -204,9 +278,9 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Protocol: `{session.protocol_name}`\n"
         f"Version: `{session.protocol_version}`\n"
         f"{kb_text}\n\n"
-        f"You can now ask questions, send voice/photos, or use:\n"
-        f"/buffer · /deviation · /calculate · /refine · /note · /end",
+        f"Ask questions, send voice/photos, or tap the buttons below.",
         parse_mode="Markdown",
+        reply_markup=_session_keyboard(),
     )
     return EXPERIMENT_ACTIVE
 
@@ -262,6 +336,22 @@ async def active_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     reply = await session.handle_message(caption, image_bytes=buf.getvalue())
     await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
+
+
+async def _button_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.args = []
+    return await cmd_buffer(update, context)
+
+
+async def _button_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.args = []
+    return await cmd_calculate(update, context)
+
+
+async def _button_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("📝 Send your note as the next message.")
+    context.user_data["_note_mode"] = True
+    return REFINE_ENTRY
 
 
 async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -360,8 +450,12 @@ async def receive_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not session:
         return ConversationHandler.END
     await update.message.chat.send_action("typing")
-    reply = await session.handle_refine(update.message.text)
-    await update.message.reply_text(reply)
+    if context.user_data.pop("_note_mode", False):
+        reply = await session.handle_message(f"Please record this note: {update.message.text}")
+        await update.message.reply_text(f"📝 {reply}")
+    else:
+        reply = await session.handle_refine(update.message.text)
+        await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -393,13 +487,15 @@ async def receive_end_findings(update: Update, context: ContextTypes.DEFAULT_TYP
             f"📊 Added to Lab Journal sheet\n\n"
             f"*Summary:*\n{display}",
             parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
         )
     except Exception as exc:
         logger.error("end_session failed: %s", exc)
         await update.message.reply_text(
             f"Session ended.\n"
             f"⚠️ Could not save to Google Drive: {exc}\n\n"
-            "Please ensure Google API credentials are configured in .env."
+            "Please ensure Google API credentials are configured in .env.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     context.user_data.pop("session", None)
@@ -415,8 +511,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("session", None)
     context.user_data.pop("protocols", None)
     context.user_data.pop("selected_protocol", None)
+    context.user_data.pop("_note_mode", None)
     await update.message.reply_text(
-        "Session cancelled. Use /start_experiment to begin a new session."
+        "Session cancelled. Use /start_experiment to begin a new session.",
+        reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
 
@@ -463,7 +561,10 @@ async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def build_conversation_handler() -> ConversationHandler:
     """Build and return the experiment session ConversationHandler."""
     return ConversationHandler(
-        entry_points=[CommandHandler("start_experiment", cmd_start_experiment)],
+        entry_points=[
+            CommandHandler("start_experiment", cmd_start_experiment),
+            CallbackQueryHandler(handle_menu_callback, pattern=r"^menu:"),
+        ],
         states={
             PROTOCOL_SELECT: [
                 CallbackQueryHandler(select_protocol, pattern=r"^proto:\d+$"),
@@ -478,6 +579,13 @@ def build_conversation_handler() -> ConversationHandler:
                 CommandHandler("deviation", cmd_deviation),
                 CommandHandler("refine", cmd_refine),
                 CommandHandler("end", cmd_end),
+                # Reply keyboard button shortcuts
+                MessageHandler(filters.Regex(r"^🔬 Buffer$"), _button_buffer),
+                MessageHandler(filters.Regex(r"^🧮 Calculate$"), _button_calculate),
+                MessageHandler(filters.Regex(r"^📋 Deviation$"), cmd_deviation),
+                MessageHandler(filters.Regex(r"^📝 Note$"), _button_note),
+                MessageHandler(filters.Regex(r"^📚 Refine$"), cmd_refine),
+                MessageHandler(filters.Regex(r"^🔚 End Session$"), cmd_end),
                 MessageHandler(filters.VOICE, active_voice),
                 MessageHandler(filters.PHOTO, active_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, active_text),

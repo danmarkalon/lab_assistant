@@ -43,6 +43,7 @@ from .handlers import (
     fallback_photo,
     fallback_text,
     fallback_voice,
+    handle_menu_callback,
 )
 
 logging.basicConfig(
