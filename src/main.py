@@ -37,6 +37,7 @@ def _patch_ssl() -> None:
 
 from .handlers import (
     build_conversation_handler,
+    build_settings_handler,
     cmd_calculate,
     cmd_help,
     cmd_start,
@@ -69,7 +70,10 @@ def build_app():
     # 1. Experiment session conversation handler (highest priority)
     app.add_handler(build_conversation_handler())
 
-    # 2. Always-available command handlers
+    # 2. Settings conversation handler
+    app.add_handler(build_settings_handler())
+
+    # 3. Always-available command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("calculate", cmd_calculate))

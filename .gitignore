@@ -2,6 +2,7 @@
 .env
 service_account.json
 *.json.key
+user_settings.json
 
 # Python
 __pycache__/

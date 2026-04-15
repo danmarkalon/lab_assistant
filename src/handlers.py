@@ -37,6 +37,13 @@ from .config import get_researcher_name
 from .google_client import list_protocols
 from .protocol_skill import ProtocolSession
 from .transcription import transcribe_ogg
+from .user_settings import (
+    AVAILABLE_MODELS,
+    get_all_settings,
+    get_researcher_name as settings_get_name,
+    get_user_model,
+    set_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,10 @@ EXPERIMENT_ACTIVE   = 2
 DEVIATION_ENTRY     = 3
 REFINE_ENTRY        = 4
 CONFIRM_END         = 5
+
+# Settings conversation states (offset to avoid collision)
+SETTINGS_MENU       = 10
+SETTINGS_EDIT_NAME  = 11
 
 # ── Per-user fallback histories (used outside experiment sessions) ─────────────
 
@@ -81,7 +92,8 @@ def _session_keyboard() -> ReplyKeyboardMarkup:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    name = get_researcher_name(user_id)
+    tg_name = update.effective_user.first_name
+    name = settings_get_name(user_id, tg_name)
     keyboard = [
         [InlineKeyboardButton("🧪 Start Experiment", callback_data="menu:start_experiment")],
         [InlineKeyboardButton("📦 Stock Orders", callback_data="menu:stock")],
@@ -246,7 +258,7 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Create the ProtocolSession and transition to EXPERIMENT_ACTIVE."""
     protocol = context.user_data["selected_protocol"]
     user_id = update.effective_user.id
-    researcher = get_researcher_name(user_id)
+    researcher = settings_get_name(user_id, update.effective_user.first_name)
     objective = update.message.text.strip()
 
     await update.message.reply_text(
@@ -553,6 +565,137 @@ async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = _get_history(update.effective_user.id)
     reply = await send_message_with_image(history, buf.getvalue(), caption)
     await update.message.reply_text(reply)
+
+
+# ── /settings ─────────────────────────────────────────────────────────────────
+
+
+def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    s = get_all_settings(user_id)
+    current_name = s.get("name") or "not set (using Telegram name)"
+    current_model = s.get("gemini_model") or "default (gemini-2.0-flash)"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"👤 Name: {current_name}",
+            callback_data="settings:edit_name",
+        )],
+        [InlineKeyboardButton(
+            f"🤖 Model: {current_model}",
+            callback_data="settings:edit_model",
+        )],
+        [InlineKeyboardButton("✅ Done", callback_data="settings:done")],
+    ])
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "⚙️ <b>Settings</b>\n\nTap a setting to change it.",
+        reply_markup=_settings_keyboard(user_id),
+        parse_mode="HTML",
+    )
+    return SETTINGS_MENU
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    action = query.data.split(":")[1]
+
+    if action == "edit_name":
+        s = get_all_settings(user_id)
+        current = s.get("name") or ""
+        await query.edit_message_text(
+            f"👤 <b>Your display name</b>\n\n"
+            f"Current: <code>{current or 'not set'}</code>\n\n"
+            "Send your name as a message, or /cancel to go back.",
+            parse_mode="HTML",
+        )
+        return SETTINGS_EDIT_NAME
+
+    elif action == "edit_model":
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'✅ ' if get_all_settings(user_id).get('gemini_model') == mid else ''}{label}",
+                callback_data=f"settings:model:{mid}",
+            )]
+            for mid, label in AVAILABLE_MODELS
+        ]
+        buttons.append([InlineKeyboardButton(
+            f"{'✅ ' if not get_all_settings(user_id).get('gemini_model') else ''}Default (from .env)",
+            callback_data="settings:model:default",
+        )])
+        await query.edit_message_text(
+            "🤖 <b>Gemini model</b>\n\nChoose a model:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML",
+        )
+        return SETTINGS_MENU
+
+    elif action.startswith("model:"):
+        model_id = action.split("model:")[1]
+        if model_id == "default":
+            set_setting(user_id, "gemini_model", None)
+            label = "default"
+        else:
+            set_setting(user_id, "gemini_model", model_id)
+            label = model_id
+        await query.edit_message_text(
+            f"✅ Model set to <code>{label}</code>.\n\n⚙️ <b>Settings</b>",
+            reply_markup=_settings_keyboard(user_id),
+            parse_mode="HTML",
+        )
+        return SETTINGS_MENU
+
+    elif action == "done":
+        s = get_all_settings(user_id)
+        name = s.get("name") or "Telegram name"
+        model = s.get("gemini_model") or "default"
+        await query.edit_message_text(
+            f"✅ <b>Settings saved</b>\n\n"
+            f"👤 Name: <code>{name}</code>\n"
+            f"🤖 Model: <code>{model}</code>",
+            parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
+    return SETTINGS_MENU
+
+
+async def settings_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Name can't be empty. Try again or /cancel.")
+        return SETTINGS_EDIT_NAME
+    set_setting(user_id, "name", name)
+    await update.message.reply_text(
+        f"✅ Name set to <b>{name}</b>.\n\nUse /settings to change other options.",
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+async def settings_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Settings closed.")
+    return ConversationHandler.END
+
+
+def build_settings_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CommandHandler("settings", cmd_settings)],
+        states={
+            SETTINGS_MENU: [
+                CallbackQueryHandler(settings_callback, pattern=r"^settings:"),
+            ],
+            SETTINGS_EDIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, settings_edit_name),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", settings_cancel)],
+        allow_reentry=True,
+    )
 
 
 # ── ConversationHandler factory ───────────────────────────────────────────────
