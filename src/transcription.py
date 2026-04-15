@@ -16,6 +16,14 @@ from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
+_ca = __import__("os").environ.get("HTTPLIB2_CA_CERTS") or __import__("os").environ.get("SSL_CERT_FILE")
+if _ca:
+    try:
+        import certifi
+        certifi.where = lambda: _ca  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
 _client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 

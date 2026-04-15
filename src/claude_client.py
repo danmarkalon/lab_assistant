@@ -24,6 +24,16 @@ from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
+# Must patch certifi BEFORE constructing the genai Client so its internal
+# httpx.AsyncClient uses the corporate CA bundle instead of the bundled certs.
+_ca = __import__("os").environ.get("HTTPLIB2_CA_CERTS") or __import__("os").environ.get("SSL_CERT_FILE")
+if _ca:
+    try:
+        import certifi
+        certifi.where = lambda: _ca  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
 _client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
