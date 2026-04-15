@@ -118,6 +118,7 @@ class ProtocolSession:
             file_id=protocol["id"],
             file_name=protocol["name"],
             modified_time=protocol.get("modifiedTime", ""),
+            parent_folder_id=(protocol.get("parents") or [""])[0],
         )
 
         system_prompt = build_system_prompt(

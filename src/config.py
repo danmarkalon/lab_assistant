@@ -25,10 +25,10 @@ GOOGLE_SERVICE_ACCOUNT_FILE: str = os.environ.get(
 )
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
-DRIVE_PROTOCOLS_FOLDER_ID: str = os.environ.get("DRIVE_PROTOCOLS_FOLDER_ID", "")
-DRIVE_SESSION_REPORTS_FOLDER_ID: str = os.environ.get(
-    "DRIVE_SESSION_REPORTS_FOLDER_ID", ""
-)
+# Single root folder — all protocol subfolders and the experiments subfolder live here.
+DRIVE_ROOT_FOLDER_ID: str = os.environ.get("DRIVE_ROOT_FOLDER_ID", "")
+# Name of the subfolder that gets created inside the root for session reports.
+DRIVE_EXPERIMENTS_SUBFOLDER = "experiments"
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 SHEETS_SPREADSHEET_ID: str = os.environ.get("SHEETS_SPREADSHEET_ID", "")
