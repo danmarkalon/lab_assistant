@@ -1,25 +1,26 @@
 """
-Voice transcription module — OpenAI Whisper-1.
+Voice transcription — Google Gemini.
 
-Telegram voice messages are sent as OGG Opus (.oga / .ogg).
-Whisper-1 accepts OGG natively; no audio conversion is needed.
+Gemini 2.0 Flash accepts OGG Opus audio natively (Telegram's voice format).
+No separate transcription service or audio conversion needed — one API key
+handles everything.
 
-Language is auto-detected by default (WHISPER_LANGUAGE = None in config).
-Set WHISPER_LANGUAGE to a BCP-47 code (e.g. "en", "he") to force a language
-and improve speed + accuracy when the lab language is known.
+Supports any spoken language; Gemini auto-detects and transcribes faithfully.
 """
 
-import io
+import base64
+import logging
 
-from openai import AsyncOpenAI
+import google.generativeai as genai
 
-from .config import OPENAI_API_KEY, WHISPER_LANGUAGE
+from .config import GEMINI_API_KEY, GEMINI_MODEL
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
 
 async def transcribe_ogg(ogg_bytes: bytes) -> str:
-    """Transcribe an OGG Opus audio buffer and return the transcript as a string.
+    """Transcribe an OGG Opus voice message using Gemini.
 
     Args:
         ogg_bytes: Raw bytes of the .ogg voice file downloaded from Telegram.
@@ -27,21 +28,27 @@ async def transcribe_ogg(ogg_bytes: bytes) -> str:
     Returns:
         Transcript string, stripped of leading/trailing whitespace.
     """
-    buf = io.BytesIO(ogg_bytes)
-    # The filename extension tells Whisper the audio format.
-    buf.name = "voice.ogg"
-
-    kwargs: dict = {
-        "model": "whisper-1",
-        "file": buf,
-        "response_format": "text",
+    model = genai.GenerativeModel(model_name=GEMINI_MODEL)
+    audio_part = {
+        "inline_data": {
+            "mime_type": "audio/ogg",
+            "data": base64.b64encode(ogg_bytes).decode("utf-8"),
+        }
     }
-    if WHISPER_LANGUAGE:
-        kwargs["language"] = WHISPER_LANGUAGE
-
-    result = await _client.audio.transcriptions.create(**kwargs)
-
-    # response_format="text" returns a plain string directly
-    if isinstance(result, str):
-        return result.strip()
-    return result.text.strip()
+    response = await model.generate_content_async(
+        contents=[
+            {
+                "role": "user",
+                "parts": [
+                    audio_part,
+                    {
+                        "text": (
+                            "Transcribe this audio accurately. "
+                            "Output only the transcribed text, nothing else."
+                        )
+                    },
+                ],
+            }
+        ]
+    )
+    return response.text.strip()

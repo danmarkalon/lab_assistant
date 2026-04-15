@@ -16,8 +16,7 @@ load_dotenv(_env_path)
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
+GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
 
 # ── Google Service Account ────────────────────────────────────────────────────
 GOOGLE_SERVICE_ACCOUNT_FILE: str = os.environ.get(
@@ -37,13 +36,10 @@ SHEET_LAB_JOURNAL = "Lab Journal"
 SHEET_STOCK_ORDERS = "Stock Orders"
 SHEET_RECEIVED = "Received Supplies"
 
-# ── Claude ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
-
-# ── Whisper ───────────────────────────────────────────────────────────────────
-# Set to a BCP-47 language code (e.g. "en", "he") to force a language and
-# improve accuracy.  None = auto-detect (handles multilingual labs).
-WHISPER_LANGUAGE: str | None = None
+# ── Gemini ────────────────────────────────────────────────────────────────────
+# gemini-2.0-flash: free tier (1500 req/day), 1M token context, vision + audio.
+# Switch to gemini-1.5-pro for higher quality on complex reasoning tasks.
+GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 # ── Team ─────────────────────────────────────────────────────────────────────
 # Map Telegram user_id (int) -> researcher display name.

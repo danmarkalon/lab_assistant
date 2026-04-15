@@ -1,26 +1,30 @@
 """
-Claude AI integration module.
+AI client module — Google Gemini.
 
-Responsibilities:
-- ConversationHistory: rolling message list for a session
-- build_system_prompt(): assembles BASE + protocol text + companion knowledge
-- send_message(): text-only Claude call
-- send_message_with_image(): multimodal (image + text) Claude call
+Drop-in replacement for the previous Anthropic implementation.
+Public interface (ConversationHistory, build_system_prompt, send_message,
+send_message_with_image, call_claude) is identical — no other modules change.
 
-All functions are async (AsyncAnthropic).
-Claude always responds in English regardless of input language.
+Model: gemini-2.0-flash  (free tier: 1500 req/day, 1M token context window)
+Handles: text, images (JPEG/PNG/GIF/WEBP), system prompts, conversation history.
+
+Gemini message format differences from Anthropic:
+  - role "assistant" → "model"
+  - parts are dicts: {"text": "..."} or {"inline_data": {"mime_type": ..., "data": ...}}
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Optional
 
-import anthropic
+import google.generativeai as genai
 
-from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from .config import GEMINI_API_KEY, GEMINI_MODEL
 
-_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
 # ── Base system prompt ────────────────────────────────────────────────────────
 
@@ -49,20 +53,25 @@ provided protocol text."""
 
 
 class ConversationHistory:
-    """Rolling list of messages for a single bot session.
+    """Rolling list of messages for a single bot session (Gemini format).
 
-    Each message is a dict with keys "role" ("user" or "assistant") and "content".
-    User content can be a plain string or a list of content blocks (for multimodal).
+    Gemini uses role="model" (not "assistant") and parts as a list of dicts:
+      {"role": "user",  "parts": [{"text": "..."}, ...]}
+      {"role": "model", "parts": [{"text": "..."}]}
     """
 
     def __init__(self) -> None:
         self.messages: list[dict] = []
 
     def add_user(self, content: str | list) -> None:
-        self.messages.append({"role": "user", "content": content})
+        if isinstance(content, str):
+            self.messages.append({"role": "user", "parts": [{"text": content}]})
+        else:
+            # Multimodal — content is already a list of part dicts
+            self.messages.append({"role": "user", "parts": content})
 
     def add_assistant(self, text: str) -> None:
-        self.messages.append({"role": "assistant", "content": text})
+        self.messages.append({"role": "model", "parts": [{"text": text}]})
 
     def clear(self) -> None:
         self.messages.clear()
@@ -80,17 +89,7 @@ def build_system_prompt(
     protocol_name: Optional[str] = None,
     protocol_version: Optional[str] = None,
 ) -> str:
-    """Assemble a system prompt, optionally embedding a protocol + companion knowledge.
-
-    Args:
-        protocol_text:    Full text extracted from the protocol .docx (body + tables).
-        companion_text:   Text from the companion knowledge Google Doc, if it exists.
-        protocol_name:    Display name of the protocol (e.g. "Western Blot").
-        protocol_version: Version string (filename or Drive modifiedTime).
-
-    Returns:
-        A single system prompt string ready to pass to the Claude API.
-    """
+    """Assemble a system prompt, optionally embedding a protocol + companion knowledge."""
     parts = [BASE_SYSTEM_PROMPT]
 
     if protocol_text:
@@ -110,7 +109,19 @@ def build_system_prompt(
     return "\n\n".join(parts)
 
 
-# ── Claude API calls ──────────────────────────────────────────────────────────
+# ── Internal helper ───────────────────────────────────────────────────────────
+
+
+def _make_model(system_prompt: str, max_tokens: int) -> genai.GenerativeModel:
+    """Create a Gemini model instance with the given system prompt."""
+    return genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=system_prompt,
+        generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+    )
+
+
+# ── Gemini API calls ──────────────────────────────────────────────────────────
 
 
 async def send_message(
@@ -119,15 +130,11 @@ async def send_message(
     system_prompt: Optional[str] = None,
     max_tokens: int = 1024,
 ) -> str:
-    """Send a text message, update history, and return Claude's reply."""
+    """Send a text message, update history, and return Gemini's reply."""
     history.add_user(user_text)
-    response = await _client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt or BASE_SYSTEM_PROMPT,
-        messages=history.messages,
-    )
-    reply: str = response.content[0].text
+    model = _make_model(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
+    response = await model.generate_content_async(contents=history.messages)
+    reply: str = response.text
     history.add_assistant(reply)
     return reply
 
@@ -140,31 +147,20 @@ async def send_message_with_image(
     system_prompt: Optional[str] = None,
     max_tokens: int = 1024,
 ) -> str:
-    """Send an image + text message, update history, and return Claude's reply.
+    """Send an image + text message, update history, and return Gemini's reply.
 
-    Telegram photos arrive as JPEG — media_type default is "image/jpeg".
-    Supported: image/jpeg, image/png, image/gif, image/webp.
+    Supported image types: image/jpeg, image/png, image/gif, image/webp.
+    Telegram photos arrive as JPEG.
     """
-    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
-    content = [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": image_data,
-            },
-        },
-        {"type": "text", "text": user_text},
+    image_data = base64.b64encode(image_bytes).decode("utf-8")
+    parts = [
+        {"inline_data": {"mime_type": media_type, "data": image_data}},
+        {"text": user_text},
     ]
-    history.add_user(content)
-    response = await _client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt or BASE_SYSTEM_PROMPT,
-        messages=history.messages,
-    )
-    reply: str = response.content[0].text
+    history.add_user(parts)
+    model = _make_model(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
+    response = await model.generate_content_async(contents=history.messages)
+    reply: str = response.text
     history.add_assistant(reply)
     return reply
 
@@ -174,15 +170,23 @@ async def call_claude(
     system_prompt: str,
     max_tokens: int = 1024,
 ) -> str:
-    """Make a standalone Claude call with explicit messages — no history update.
+    """Make a standalone Gemini call — no history update.
 
     Used for one-off calls such as generating summaries or drafting knowledge
-    notes, where polluting the session history would be undesirable.
+    notes. Accepts both Gemini ("parts") and legacy Anthropic ("content") message
+    formats so that protocol_skill.py needs no changes.
     """
-    response = await _client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=messages,
-    )
-    return response.content[0].text.strip()
+    gemini_messages = []
+    for msg in messages:
+        if "parts" in msg:
+            gemini_messages.append(msg)
+        else:
+            # Convert legacy {"role": ..., "content": "..."} format
+            role = "model" if msg.get("role") == "assistant" else "user"
+            gemini_messages.append(
+                {"role": role, "parts": [{"text": msg.get("content", "")}]}
+            )
+
+    model = _make_model(system_prompt, max_tokens)
+    response = await model.generate_content_async(contents=gemini_messages)
+    return response.text.strip()
