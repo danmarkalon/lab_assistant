@@ -218,19 +218,19 @@ async def _generate_with_fallback(
     notified = False
     backoff = 1.0
 
-    # Two full passes through the model chain:
-    # Pass 1: fast cascade (503 = skip, RPM = backoff then skip).
-    # Pass 2: if everything 503'd, wait 15s then try the primary model once more.
-    for chain_pass in range(2):
-        if chain_pass == 1:
-            # All models were overloaded — brief pause then one last attempt with primary
-            logger.warning("All models returned 503, waiting 15s then retrying primary")
-            await asyncio.sleep(15)
-            models_to_try = MODEL_CHAIN[:1]
-        else:
-            models_to_try = MODEL_CHAIN
+    # Pass 1: fast cascade (503 = skip immediately, RPM = backoff then skip).
+    # Pass 2: wait 15s, then retry the full chain again (503 spikes are brief).
+    # Pass 3: wait 30s, final attempt on full chain.
+    for chain_pass in range(3):
+        if chain_pass > 0:
+            wait = 15 if chain_pass == 1 else 30
+            logger.warning("Pass %d: all models failed, waiting %ds then retrying full chain", chain_pass + 1, wait)
+            if not notified and notify_retry:
+                notified = True
+                await notify_retry()
+            await asyncio.sleep(wait)
 
-        for model in models_to_try:
+        for model in MODEL_CHAIN:
             # Up to 3 attempts per model for RPM backoff; 503 cascades immediately
             for attempt in range(3):
                 if _throttle_delay > 0:
@@ -282,7 +282,7 @@ async def _generate_with_fallback(
             if model != MODEL_CHAIN[-1]:
                 logger.warning("Cascading from %s to next model", model)
 
-    logger.error("All models in fallback chain failed after both passes")
+    logger.error("All models in fallback chain failed after %d passes", 3)
     return _friendly_api_error(last_exc) if last_exc else "⚠️ AI unavailable. Please try again."
 
 
