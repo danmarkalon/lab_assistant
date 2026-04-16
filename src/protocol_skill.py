@@ -32,9 +32,11 @@ from .claude_client import (
 from .config import SHEET_LAB_JOURNAL
 from .google_client import (
     append_doc_text,
+    append_experiment_rows,
     append_sheet_row,
-    find_experiments_doc_id,
-    get_doc_url,
+    create_experiment_tab,
+    find_experiments_sheet_id,
+    get_sheet_url,
 )
 from .protocol_loader import load_protocol
 
@@ -83,17 +85,16 @@ class ProtocolSession:
         protocol_name: str,
         protocol_version: str,
         companion_doc_id: Optional[str],
-        experiments_doc_id: Optional[str],
         researcher_name: str,
         objective: str,
         system_prompt: str,
         protocol_folder_id: str = "",
         folder_name: str = "",
+        experiments_spreadsheet_id: Optional[str] = None,
     ) -> None:
         self.protocol_name = protocol_name
         self.protocol_version = protocol_version
         self.companion_doc_id = companion_doc_id
-        self.experiments_doc_id = experiments_doc_id
         self.researcher_name = researcher_name
         self.objective = objective
         self.system_prompt = system_prompt
@@ -105,6 +106,10 @@ class ProtocolSession:
         # Append-only log of key session events (deviations, notes, buffers).
         # Used for summary generation so we don't pay for the full history.
         self._event_log: list[str] = []
+        # Experiments spreadsheet (per-protocol, user-created)
+        self._exp_spreadsheet_id = experiments_spreadsheet_id
+        self._exp_tab_title: str = ""     # set in create() after tab creation
+        self._exp_tab_sheet_id: int = 0   # gid for URL linking
 
     @classmethod
     async def create(
@@ -139,12 +144,12 @@ class ProtocolSession:
         folder_name = protocol.get("name", "")
         folder_id = protocol.get("folder_id", "")
 
-        # Find pre-created experiments log doc
-        experiments_doc_id = await find_experiments_doc_id(folder_name, folder_id)
-        if experiments_doc_id:
-            logger.info("Found experiments doc for '%s' (id=%s)", folder_name, experiments_doc_id)
+        # Find pre-created experiments spreadsheet
+        exp_sheet_id = await find_experiments_sheet_id(folder_name, folder_id)
+        if exp_sheet_id:
+            logger.info("Found experiments spreadsheet for '%s' (id=%s)", folder_name, exp_sheet_id)
         else:
-            logger.warning("No experiments doc found for '%s' — live logging disabled", folder_name)
+            logger.warning("No experiments spreadsheet for '%s' — live logging disabled", folder_name)
 
         system_prompt = build_system_prompt(
             protocol_text=protocol_text,
@@ -157,46 +162,64 @@ class ProtocolSession:
             protocol_name=protocol_name,
             protocol_version=protocol_version,
             companion_doc_id=companion_doc_id,
-            experiments_doc_id=experiments_doc_id,
             researcher_name=researcher_name,
             objective=objective,
             system_prompt=system_prompt,
             protocol_folder_id=folder_id,
             folder_name=folder_name,
+            experiments_spreadsheet_id=exp_sheet_id,
         )
 
-        # Write session header to experiments doc immediately
-        await session._doc_write_header()
+        # Create a new tab for this experiment and write header
+        await session._sheet_init()
 
         return session
 
-    # ── Live doc append ──────────────────────────────────────────────────────
+    # ── Live experiment sheet logging ────────────────────────────────────────
 
-    async def _doc_append(self, text: str) -> None:
-        """Append text to the experiments doc. Silently logs on failure."""
-        if not self.experiments_doc_id:
+    async def _sheet_init(self) -> None:
+        """Create a new tab in the experiments spreadsheet and write the header."""
+        if not self._exp_spreadsheet_id:
+            return
+        self._exp_tab_title = f"{self.session_date} — {self.researcher_name}"
+        try:
+            self._exp_tab_sheet_id = await create_experiment_tab(
+                self._exp_spreadsheet_id, self._exp_tab_title
+            )
+            # Write header rows
+            await append_experiment_rows(
+                self._exp_spreadsheet_id,
+                self._exp_tab_title,
+                [
+                    ["Protocol", self.protocol_name],
+                    ["Version", self.protocol_version],
+                    ["Date", self.session_date],
+                    ["Time", self.session_time],
+                    ["Researcher", self.researcher_name],
+                    ["Objective", self.objective],
+                    [],  # blank separator
+                    ["Time", "Type", "Content", "AI Response"],
+                ],
+            )
+        except Exception as exc:
+            logger.error("Failed to create experiment tab: %s", exc)
+            self._exp_spreadsheet_id = None  # disable further writes
+
+    async def _sheet_append(self, rows: list[list]) -> None:
+        """Append rows to the experiment tab. Silently logs on failure."""
+        if not self._exp_spreadsheet_id:
             return
         try:
-            await append_doc_text(self.experiments_doc_id, text)
+            await append_experiment_rows(
+                self._exp_spreadsheet_id, self._exp_tab_title, rows
+            )
         except Exception as exc:
-            logger.warning("Live-append to experiments doc failed: %s", exc)
-
-    async def _doc_write_header(self) -> None:
-        """Write the session header block at the start of a new session."""
-        header = (
-            f"\n{'═' * 60}\n"
-            f"SESSION: {self.protocol_name}\n"
-            f"Date: {self.session_date}  {self.session_time}\n"
-            f"Researcher: {self.researcher_name}\n"
-            f"Objective: {self.objective}\n"
-            f"{'═' * 60}\n"
-        )
-        await self._doc_append(header)
+            logger.warning("Live-append to experiment sheet failed: %s", exc)
 
     @property
-    def experiments_doc_url(self) -> str:
-        if self.experiments_doc_id:
-            return get_doc_url(self.experiments_doc_id)
+    def experiments_sheet_url(self) -> str:
+        if self._exp_spreadsheet_id:
+            return get_sheet_url(self._exp_spreadsheet_id, self._exp_tab_sheet_id)
         return ""
 
     # ── Message routing ───────────────────────────────────────────────────────
@@ -219,13 +242,10 @@ class ProtocolSession:
         else:
             reply = await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
 
-        # Live-append the exchange to the experiments doc
+        # Live-append the exchange to the experiments sheet
         ts = datetime.now(_TZ).strftime("%H:%M")
-        user_label = "[📷 Image] " if image_bytes else ""
-        await self._doc_append(
-            f"\n[{ts}] Researcher: {user_label}{text}\n"
-            f"[{ts}] Assistant: {reply}\n"
-        )
+        msg_type = "📷 Image + Text" if image_bytes else "💬 Message"
+        await self._sheet_append([[ts, msg_type, text, reply]])
         return reply
 
     async def handle_deviation(self, description: str) -> str:
@@ -234,10 +254,7 @@ class ProtocolSession:
         prompt = _DEVIATION_PREFIX.format(description=description)
         reply = await send_message(self.history, prompt, system_prompt=self.system_prompt)
         ts = datetime.now(_TZ).strftime("%H:%M")
-        await self._doc_append(
-            f"\n[{ts}] ⚠️ DEVIATION: {description}\n"
-            f"[{ts}] Assistant: {reply}\n"
-        )
+        await self._sheet_append([[ts, "⚠️ Deviation", description, reply]])
         return reply
 
     # ── Knowledge refinement ──────────────────────────────────────────────────
@@ -315,27 +332,22 @@ class ProtocolSession:
         )
 
     async def end_session(self) -> tuple[str, str]:
-        """Close the session: generate summary, append to experiments doc, log to Lab Journal.
+        """Close the session: generate summary, append to experiment sheet, log to Lab Journal.
 
         Returns:
-            (summary_text, experiments_doc_url)
+            (summary_text, experiments_sheet_url)
         """
         summary = await self._generate_summary()
 
-        # Append summary to the experiments doc
+        # Write summary to experiment sheet
         ts = datetime.now(_TZ).strftime("%H:%M")
-        summary_block = (
-            f"\n{'─' * 40}\n"
-            f"[{ts}] SESSION SUMMARY\n"
-            f"{'─' * 40}\n\n"
-            f"{summary}\n"
-            f"\n{'═' * 60}\n"
-            f"END OF SESSION\n"
-            f"{'═' * 60}\n"
-        )
-        await self._doc_append(summary_block)
+        await self._sheet_append([
+            [],
+            [ts, "📋 Summary", summary],
+            [ts, "🔚 Session End", ""],
+        ])
 
-        doc_url = self.experiments_doc_url
+        sheet_url = self.experiments_sheet_url
 
         await append_sheet_row(
             SHEET_LAB_JOURNAL,
@@ -346,10 +358,10 @@ class ProtocolSession:
                 self.protocol_name,                              # Protocol
                 self.protocol_version,                           # Protocol Version
                 self.objective,                                  # Objective / Target
-                doc_url,                                         # Experiments Doc Link
+                sheet_url,                                       # Experiment Sheet Link
                 "Completed",                                     # Status
             ],
         )
 
-        logger.info("Session ended: '%s' — experiments doc at %s", self.protocol_name, doc_url or "(none)")
-        return summary, doc_url
+        logger.info("Session ended: '%s' — experiment sheet at %s", self.protocol_name, sheet_url or "(none)")
+        return summary, sheet_url

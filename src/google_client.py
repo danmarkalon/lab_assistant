@@ -260,6 +260,106 @@ async def find_experiments_doc_id(
     return await _run(_find_experiments_doc_sync, folder_name, parent_folder_id)
 
 
+# ── Experiments Spreadsheet (per-protocol) ────────────────────────────────────
+
+
+def _find_experiments_sheet_sync(folder_name: str, parent_folder_id: str) -> Optional[str]:
+    """Search for an experiments Spreadsheet in the protocol folder.
+
+    Naming conventions (tried in order):
+      1. {folder_name}_experiments  (Google Sheet)
+      2. Any Google Sheet whose name contains '_experiments'
+    """
+    svc = _get_service("drive", "v3")
+    safe = folder_name.replace("'", "\\'")
+    q = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.spreadsheet'"
+        f" and name='{safe}_experiments'"
+        " and trashed=false"
+    )
+    result = svc.files().list(q=q, fields="files(id, name)").execute()
+    files = result.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    q2 = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.spreadsheet'"
+        " and name contains '_experiments'"
+        " and trashed=false"
+    )
+    result2 = svc.files().list(q=q2, fields="files(id, name)").execute()
+    files2 = result2.get("files", [])
+    return files2[0]["id"] if files2 else None
+
+
+async def find_experiments_sheet_id(
+    folder_name: str, parent_folder_id: str
+) -> Optional[str]:
+    """Find the experiments Spreadsheet for a protocol.
+
+    Returns spreadsheet_id or None.
+    """
+    return await _run(_find_experiments_sheet_sync, folder_name, parent_folder_id)
+
+
+def _create_experiment_tab_sync(
+    spreadsheet_id: str, tab_title: str
+) -> int:
+    """Create a new sheet tab at position 0 (leftmost). Returns the sheetId."""
+    svc = _get_service("sheets", "v4")
+    resp = svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": tab_title,
+                            "index": 0,
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+    sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+    logger.info("Created experiment tab '%s' (sheetId=%d) at index 0", tab_title, sheet_id)
+    return sheet_id
+
+
+async def create_experiment_tab(spreadsheet_id: str, tab_title: str) -> int:
+    """Create a new sheet tab at position 0 (newest first). Returns sheetId."""
+    return await _run(_create_experiment_tab_sync, spreadsheet_id, tab_title)
+
+
+def _append_experiment_rows_sync(
+    spreadsheet_id: str, tab_title: str, rows: list[list]
+) -> None:
+    """Append rows to a specific tab in an experiments spreadsheet."""
+    svc = _get_service("sheets", "v4")
+    safe_title = tab_title.replace("'", "''")
+    svc.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{safe_title}'!A:A",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
+
+
+async def append_experiment_rows(
+    spreadsheet_id: str, tab_title: str, rows: list[list]
+) -> None:
+    """Append rows to a tab in the experiments spreadsheet."""
+    await _run(_append_experiment_rows_sync, spreadsheet_id, tab_title, rows)
+
+
+def get_sheet_url(spreadsheet_id: str, sheet_id: int = 0) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet_id}"
+
+
 # ── Drive — folder management ─────────────────────────────────────────────────
 
 

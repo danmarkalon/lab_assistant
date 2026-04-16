@@ -305,9 +305,9 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else "📚 Knowledge base: none yet (create a `_context` Google Doc to start one)"
     )
     exp_text = (
-        f"📝 Live experiment log: [open doc]({session.experiments_doc_url})" if session.experiments_doc_id
+        f"📝 Live experiment log: [open sheet]({session.experiments_sheet_url})" if session._exp_spreadsheet_id
         else (
-            f"⚠️ No experiments doc found. Create a Google Doc named "
+            f"⚠️ No experiments sheet found. Create a Google Sheet named "
             f"`{session.folder_name}_experiments` in the protocol folder to enable live logging."
         )
     )
@@ -522,13 +522,13 @@ async def receive_end_findings(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("⏳ Generating session summary and saving to Drive...")
 
     try:
-        summary, doc_url = await session.end_session()
+        summary, sheet_url = await session.end_session()
         # Truncate summary for Telegram (max message length)
         display = summary[:1800] + ("..." if len(summary) > 1800 else "")
-        doc_line = f"📄 [Open session report]({doc_url})\n" if doc_url else ""
+        sheet_line = f"📄 [Open experiment sheet]({sheet_url})\n" if sheet_url else ""
         await update.message.reply_text(
             f"✅ *Session closed.*\n\n"
-            f"{doc_line}"
+            f"{sheet_line}"
             f"📊 Added to Lab Journal sheet\n\n"
             f"*Summary:*\n{display}",
             parse_mode="Markdown",
