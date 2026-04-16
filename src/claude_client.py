@@ -218,55 +218,67 @@ async def _generate_with_fallback(
     notified = False
     backoff = 1.0
 
-    for model in MODEL_CHAIN:
-        # Up to 3 attempts per model for RPM backoff; 503 cascades immediately
-        for attempt in range(3):
-            if _throttle_delay > 0:
-                await asyncio.sleep(_throttle_delay)
-            try:
-                response = await _client.aio.models.generate_content(
-                    model=model, contents=contents, config=config
-                )
-                if model != MODEL_CHAIN[0]:
-                    logger.info("Succeeded on fallback model %s", model)
-                return response.text
-            except genai_errors.ClientError as exc:
-                last_exc = exc
+    # Two full passes through the model chain:
+    # Pass 1: fast cascade (503 = skip, RPM = backoff then skip).
+    # Pass 2: if everything 503'd, wait 15s then try the primary model once more.
+    for chain_pass in range(2):
+        if chain_pass == 1:
+            # All models were overloaded — brief pause then one last attempt with primary
+            logger.warning("All models returned 503, waiting 15s then retrying primary")
+            await asyncio.sleep(15)
+            models_to_try = MODEL_CHAIN[:1]
+        else:
+            models_to_try = MODEL_CHAIN
 
-                # Daily quota — no point retrying any model
-                if _is_daily_error(exc):
-                    logger.warning("Daily quota hit on %s", model)
+        for model in models_to_try:
+            # Up to 3 attempts per model for RPM backoff; 503 cascades immediately
+            for attempt in range(3):
+                if _throttle_delay > 0:
+                    await asyncio.sleep(_throttle_delay)
+                try:
+                    response = await _client.aio.models.generate_content(
+                        model=model, contents=contents, config=config
+                    )
+                    if model != MODEL_CHAIN[0]:
+                        logger.info("Succeeded on fallback model %s", model)
+                    return response.text
+                except genai_errors.ClientError as exc:
+                    last_exc = exc
+
+                    # Daily quota — no point retrying any model
+                    if _is_daily_error(exc):
+                        logger.warning("Daily quota hit on %s", model)
+                        return _friendly_api_error(exc)
+
+                    # 503 — model is overloaded, cascade to next model immediately
+                    if exc.code == 503:
+                        logger.warning("503 on %s, cascading to next model", model)
+                        if not notified and notify_retry:
+                            notified = True
+                            await notify_retry()
+                        break  # cascade
+
+                    # RPM quota — exponential backoff, then cascade after 3 failures
+                    if _is_rpm_error(exc):
+                        wait = min(backoff, 60.0)
+                        backoff = min(backoff * 2, 60.0)
+                        _throttle_delay = max(_throttle_delay, 4.0)
+                        logger.warning("RPM hit on %s, backoff %.0fs (throttle now %.0fs)", model, wait, _throttle_delay)
+                        if not notified and notify_retry:
+                            notified = True
+                            await notify_retry()
+                        await asyncio.sleep(wait)
+                        continue  # retry same model first, cascade after 3 failures
+
+                    # Other error (auth, not-found, etc.) — fail immediately
+                    logger.error("Gemini API error on %s: %s", model, exc)
                     return _friendly_api_error(exc)
 
-                # 503 — model is overloaded, cascade to next model immediately
-                if exc.code == 503:
-                    logger.warning("503 on %s, cascading to next model", model)
-                    if not notified and notify_retry:
-                        notified = True
-                        await notify_retry()
-                    break  # cascade
+            # All attempts exhausted for this model — cascade
+            if model != MODEL_CHAIN[-1]:
+                logger.warning("Cascading from %s to next model", model)
 
-                # RPM quota — exponential backoff, then cascade after 3 failures
-                if _is_rpm_error(exc):
-                    wait = min(backoff, 60.0)
-                    backoff = min(backoff * 2, 60.0)
-                    _throttle_delay = max(_throttle_delay, 4.0)
-                    logger.warning("RPM hit on %s, backoff %.0fs (throttle now %.0fs)", model, wait, _throttle_delay)
-                    if not notified and notify_retry:
-                        notified = True
-                        await notify_retry()
-                    await asyncio.sleep(wait)
-                    continue  # retry same model first, cascade after 3 failures
-
-                # Other error (auth, not-found, etc.) — fail immediately
-                logger.error("Gemini API error on %s: %s", model, exc)
-                return _friendly_api_error(exc)
-
-        # All attempts exhausted for this model — cascade
-        if model != MODEL_CHAIN[-1]:
-            logger.warning("Cascading from %s to next model", model)
-
-    logger.error("All models in fallback chain failed")
+    logger.error("All models in fallback chain failed after both passes")
     return _friendly_api_error(last_exc) if last_exc else "⚠️ AI unavailable. Please try again."
 
 
