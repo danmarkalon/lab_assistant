@@ -218,6 +218,48 @@ async def find_companion_doc_id(
     return await _run(_find_companion_sync, folder_name, parent_folder_id)
 
 
+def _find_experiments_doc_sync(folder_name: str, parent_folder_id: str) -> Optional[str]:
+    """Search for an experiments log Google Doc in the protocol folder.
+
+    Naming conventions (tried in order):
+      1. {folder_name}_experiments
+      2. Any Google Doc whose name contains '_experiments'
+    """
+    svc = _get_service("drive", "v3")
+    safe = folder_name.replace("'", "\\'")
+    q = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.document'"
+        f" and name='{safe}_experiments'"
+        " and trashed=false"
+    )
+    result = svc.files().list(q=q, fields="files(id, name)").execute()
+    files = result.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    q2 = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.document'"
+        " and name contains '_experiments'"
+        " and trashed=false"
+    )
+    result2 = svc.files().list(q=q2, fields="files(id, name)").execute()
+    files2 = result2.get("files", [])
+    return files2[0]["id"] if files2 else None
+
+
+async def find_experiments_doc_id(
+    folder_name: str, parent_folder_id: str
+) -> Optional[str]:
+    """Find the experiments log Google Doc for a protocol.
+
+    Naming convention: {folder_name}_experiments (Google Doc in the protocol folder)
+    Returns doc_id or None.
+    """
+    return await _run(_find_experiments_doc_sync, folder_name, parent_folder_id)
+
+
 # ── Drive — folder management ─────────────────────────────────────────────────
 
 

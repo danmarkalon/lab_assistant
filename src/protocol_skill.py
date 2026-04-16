@@ -17,8 +17,9 @@ Usage:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from .claude_client import (
     BASE_SYSTEM_PROMPT,
@@ -32,12 +33,14 @@ from .config import SHEET_LAB_JOURNAL
 from .google_client import (
     append_doc_text,
     append_sheet_row,
-    create_session_doc,
+    find_experiments_doc_id,
     get_doc_url,
 )
 from .protocol_loader import load_protocol
 
 logger = logging.getLogger(__name__)
+
+_TZ = ZoneInfo("Asia/Jerusalem")
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
@@ -80,20 +83,25 @@ class ProtocolSession:
         protocol_name: str,
         protocol_version: str,
         companion_doc_id: Optional[str],
+        experiments_doc_id: Optional[str],
         researcher_name: str,
         objective: str,
         system_prompt: str,
         protocol_folder_id: str = "",
+        folder_name: str = "",
     ) -> None:
         self.protocol_name = protocol_name
         self.protocol_version = protocol_version
         self.companion_doc_id = companion_doc_id
+        self.experiments_doc_id = experiments_doc_id
         self.researcher_name = researcher_name
         self.objective = objective
         self.system_prompt = system_prompt
         self.protocol_folder_id = protocol_folder_id
+        self.folder_name = folder_name
         self.history = ConversationHistory()
-        self.session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.session_date = datetime.now(_TZ).strftime("%Y-%m-%d")
+        self.session_time = datetime.now(_TZ).strftime("%H:%M")
         # Append-only log of key session events (deviations, notes, buffers).
         # Used for summary generation so we don't pay for the full history.
         self._event_log: list[str] = []
@@ -128,6 +136,16 @@ class ProtocolSession:
             is_gdoc=protocol.get("is_gdoc", False),
         )
 
+        folder_name = protocol.get("name", "")
+        folder_id = protocol.get("folder_id", "")
+
+        # Find pre-created experiments log doc
+        experiments_doc_id = await find_experiments_doc_id(folder_name, folder_id)
+        if experiments_doc_id:
+            logger.info("Found experiments doc for '%s' (id=%s)", folder_name, experiments_doc_id)
+        else:
+            logger.warning("No experiments doc found for '%s' — live logging disabled", folder_name)
+
         system_prompt = build_system_prompt(
             protocol_text=protocol_text,
             companion_text=companion_text if companion_text.strip() else None,
@@ -135,15 +153,51 @@ class ProtocolSession:
             protocol_version=protocol_version,
         )
 
-        return cls(
+        session = cls(
             protocol_name=protocol_name,
             protocol_version=protocol_version,
             companion_doc_id=companion_doc_id,
+            experiments_doc_id=experiments_doc_id,
             researcher_name=researcher_name,
             objective=objective,
             system_prompt=system_prompt,
-            protocol_folder_id=protocol.get("folder_id", ""),
+            protocol_folder_id=folder_id,
+            folder_name=folder_name,
         )
+
+        # Write session header to experiments doc immediately
+        await session._doc_write_header()
+
+        return session
+
+    # ── Live doc append ──────────────────────────────────────────────────────
+
+    async def _doc_append(self, text: str) -> None:
+        """Append text to the experiments doc. Silently logs on failure."""
+        if not self.experiments_doc_id:
+            return
+        try:
+            await append_doc_text(self.experiments_doc_id, text)
+        except Exception as exc:
+            logger.warning("Live-append to experiments doc failed: %s", exc)
+
+    async def _doc_write_header(self) -> None:
+        """Write the session header block at the start of a new session."""
+        header = (
+            f"\n{'═' * 60}\n"
+            f"SESSION: {self.protocol_name}\n"
+            f"Date: {self.session_date}  {self.session_time}\n"
+            f"Researcher: {self.researcher_name}\n"
+            f"Objective: {self.objective}\n"
+            f"{'═' * 60}\n"
+        )
+        await self._doc_append(header)
+
+    @property
+    def experiments_doc_url(self) -> str:
+        if self.experiments_doc_id:
+            return get_doc_url(self.experiments_doc_id)
+        return ""
 
     # ── Message routing ───────────────────────────────────────────────────────
 
@@ -155,20 +209,36 @@ class ProtocolSession:
     ) -> str:
         """Route a text or image+text message through the Protocol Expert."""
         if image_bytes:
-            return await send_message_with_image(
+            reply = await send_message_with_image(
                 self.history,
                 image_bytes,
                 text,
                 system_prompt=self.system_prompt,
                 notify_retry=notify_retry,
             )
-        return await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
+        else:
+            reply = await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
+
+        # Live-append the exchange to the experiments doc
+        ts = datetime.now(_TZ).strftime("%H:%M")
+        user_label = "[📷 Image] " if image_bytes else ""
+        await self._doc_append(
+            f"\n[{ts}] Researcher: {user_label}{text}\n"
+            f"[{ts}] Assistant: {reply}\n"
+        )
+        return reply
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""
         self._event_log.append(f"[DEVIATION] {description}")
         prompt = _DEVIATION_PREFIX.format(description=description)
-        return await send_message(self.history, prompt, system_prompt=self.system_prompt)
+        reply = await send_message(self.history, prompt, system_prompt=self.system_prompt)
+        ts = datetime.now(_TZ).strftime("%H:%M")
+        await self._doc_append(
+            f"\n[{ts}] ⚠️ DEVIATION: {description}\n"
+            f"[{ts}] Assistant: {reply}\n"
+        )
+        return reply
 
     # ── Knowledge refinement ──────────────────────────────────────────────────
 
@@ -245,47 +315,27 @@ class ProtocolSession:
         )
 
     async def end_session(self) -> tuple[str, str]:
-        """Close the session: generate summary, save to Google Doc, log to Lab Journal.
-
-        If the service account cannot create new Docs (e.g. zero storage quota),
-        the summary is still saved to the companion doc (if available) and the
-        Lab Journal sheet.
+        """Close the session: generate summary, append to experiments doc, log to Lab Journal.
 
         Returns:
-            (summary_text, doc_url_or_empty)
+            (summary_text, experiments_doc_url)
         """
         summary = await self._generate_summary()
 
-        report = (
-            f"Protocol: {self.protocol_name}\n"
-            f"Version: {self.protocol_version}\n"
-            f"Date: {self.session_date}\n"
-            f"Researcher: {self.researcher_name}\n"
-            f"Objective: {self.objective}\n"
-            f"\n{'=' * 60}\nSESSION SUMMARY\n{'=' * 60}\n\n"
-            f"{summary}"
+        # Append summary to the experiments doc
+        ts = datetime.now(_TZ).strftime("%H:%M")
+        summary_block = (
+            f"\n{'─' * 40}\n"
+            f"[{ts}] SESSION SUMMARY\n"
+            f"{'─' * 40}\n\n"
+            f"{summary}\n"
+            f"\n{'═' * 60}\n"
+            f"END OF SESSION\n"
+            f"{'═' * 60}\n"
         )
+        await self._doc_append(summary_block)
 
-        # Try creating a dedicated session doc; fall back to companion doc.
-        doc_url = ""
-        doc_title = (
-            f"{self.protocol_name} — {self.session_date} — {self.researcher_name}"
-        )
-        try:
-            doc_id = await create_session_doc(doc_title, self.protocol_folder_id)
-            await append_doc_text(doc_id, report)
-            doc_url = get_doc_url(doc_id)
-        except Exception as exc:
-            logger.warning("Could not create session doc (%s), falling back to companion doc", exc)
-            # Append the report to the companion doc instead
-            if self.companion_doc_id:
-                try:
-                    separator = f"\n\n{'─' * 40}\n📋 SESSION REPORT — {self.session_date}\n{'─' * 40}\n\n"
-                    await append_doc_text(self.companion_doc_id, separator + report)
-                    doc_url = get_doc_url(self.companion_doc_id)
-                    logger.info("Session report appended to companion doc %s", doc_url)
-                except Exception as exc2:
-                    logger.error("Companion doc append also failed: %s", exc2)
+        doc_url = self.experiments_doc_url
 
         await append_sheet_row(
             SHEET_LAB_JOURNAL,
@@ -296,10 +346,10 @@ class ProtocolSession:
                 self.protocol_name,                              # Protocol
                 self.protocol_version,                           # Protocol Version
                 self.objective,                                  # Objective / Target
-                doc_url,                                         # Session Doc Link
+                doc_url,                                         # Experiments Doc Link
                 "Completed",                                     # Status
             ],
         )
 
-        logger.info("Session ended: '%s' — report at %s", doc_title, doc_url or "(no doc)")
+        logger.info("Session ended: '%s' — experiments doc at %s", self.protocol_name, doc_url or "(none)")
         return summary, doc_url

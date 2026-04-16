@@ -304,11 +304,19 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "📚 Knowledge base: loaded ✅" if session.companion_doc_id
         else "📚 Knowledge base: none yet (create a `_context` Google Doc to start one)"
     )
+    exp_text = (
+        f"📝 Live experiment log: [open doc]({session.experiments_doc_url})" if session.experiments_doc_id
+        else (
+            f"⚠️ No experiments doc found. Create a Google Doc named "
+            f"`{session.folder_name}_experiments` in the protocol folder to enable live logging."
+        )
+    )
     await update.message.reply_text(
         f"✅ *Protocol Expert loaded*\n"
         f"Protocol: `{session.protocol_name}`\n"
         f"Version: `{session.protocol_version}`\n"
-        f"{kb_text}\n\n"
+        f"{kb_text}\n"
+        f"{exp_text}\n\n"
         f"Ask questions, send voice/photos, or tap the buttons below.",
         parse_mode="Markdown",
         reply_markup=_session_keyboard(),
