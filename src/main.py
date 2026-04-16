@@ -16,9 +16,11 @@ Or from a Jupyter notebook (nest_asyncio handles the running event loop):
 
 import logging
 import os
+import traceback
 
 import nest_asyncio
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import TELEGRAM_BOT_TOKEN
 
@@ -83,7 +85,19 @@ def build_app():
     app.add_handler(MessageHandler(filters.VOICE, fallback_voice))
     app.add_handler(MessageHandler(filters.PHOTO, fallback_photo))
 
+    # 4. Global error handler — catches any uncaught exception in a handler
+    app.add_error_handler(_error_handler)
+
     return app
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log uncaught handler exceptions and notify the user if possible."""
+    logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "⚠️ Something went wrong on my end. Please try again."
+        )
 
 
 def run() -> None:

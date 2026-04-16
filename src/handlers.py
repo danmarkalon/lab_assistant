@@ -33,7 +33,7 @@ from telegram.ext import (
 )
 
 from .claude_client import BASE_SYSTEM_PROMPT, ConversationHistory, send_message, send_message_with_image
-from .config import get_researcher_name
+from .config import get_researcher_name, is_allowed
 from .google_client import list_protocols
 from .protocol_skill import ProtocolSession
 from .transcription import transcribe_ogg
@@ -61,6 +61,20 @@ SETTINGS_MENU       = 10
 SETTINGS_EDIT_NAME  = 11
 
 # ── Per-user fallback histories (used outside experiment sessions) ─────────────
+
+
+async def _check_allowed(update: Update) -> bool:
+    """Return True if the user is on the allowlist. Silently ignores unauthorized users
+    but logs the attempt with their ID so the admin can add them."""
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        logger.warning(
+            "Unauthorized access attempt from user_id=%s name=%s",
+            user_id,
+            update.effective_user.first_name,
+        )
+        return False
+    return True
 
 _histories: dict[int, ConversationHistory] = {}
 
@@ -91,8 +105,11 @@ def _session_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
     user_id = update.effective_user.id
     tg_name = update.effective_user.first_name
+    logger.info("/start from user_id=%s name=%s", user_id, tg_name)
     name = settings_get_name(user_id, tg_name)
     keyboard = [
         [InlineKeyboardButton("🧪 Start Experiment", callback_data="menu:start_experiment")],
@@ -195,6 +212,8 @@ async def cmd_start_experiment(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     """List protocols from Drive and ask the user to pick one."""
+    if not await _check_allowed(update):
+        return ConversationHandler.END
     await update.message.chat.send_action("typing")
     try:
         protocols = await list_protocols()
@@ -535,6 +554,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
     history = _get_history(update.effective_user.id)
     await update.message.chat.send_action("typing")
     reply = await send_message(history, update.message.text)
@@ -542,6 +563,8 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
     await update.message.chat.send_action("typing")
     voice_file = await update.message.voice.get_file()
     buf = io.BytesIO()
@@ -554,6 +577,8 @@ async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_allowed(update):
+        return
     await update.message.chat.send_action("typing")
     photo_file = await update.message.photo[-1].get_file()
     buf = io.BytesIO()

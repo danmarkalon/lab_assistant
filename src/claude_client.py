@@ -20,6 +20,7 @@ import logging
 from typing import Optional
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
@@ -134,6 +135,16 @@ def _make_config(system_prompt: str, max_tokens: int) -> genai_types.GenerateCon
 # ── Gemini API calls ──────────────────────────────────────────────────────────
 
 
+def _friendly_api_error(exc: genai_errors.ClientError) -> str:
+    """Return a user-facing message for common Gemini API errors."""
+    if exc.code == 429:
+        return (
+            "⚠️ The AI is temporarily unavailable — the free-tier quota has been reached. "
+            "Please try again in a few minutes, or contact the admin to enable billing."
+        )
+    return f"⚠️ AI error ({exc.code}): {exc.message}"
+
+
 async def send_message(
     history: ConversationHistory,
     user_text: str,
@@ -143,9 +154,13 @@ async def send_message(
     """Send a text message, update history, and return Gemini's reply."""
     history.add_user(user_text)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    response = await _client.aio.models.generate_content(
-        model=GEMINI_MODEL, contents=history.messages, config=cfg
-    )
+    try:
+        response = await _client.aio.models.generate_content(
+            model=GEMINI_MODEL, contents=history.messages, config=cfg
+        )
+    except genai_errors.ClientError as exc:
+        logger.error("Gemini API error in send_message: %s", exc)
+        return _friendly_api_error(exc)
     reply: str = response.text
     history.add_assistant(reply)
     return reply
@@ -171,9 +186,13 @@ async def send_message_with_image(
     ]
     history.add_user(parts)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    response = await _client.aio.models.generate_content(
-        model=GEMINI_MODEL, contents=history.messages, config=cfg
-    )
+    try:
+        response = await _client.aio.models.generate_content(
+            model=GEMINI_MODEL, contents=history.messages, config=cfg
+        )
+    except genai_errors.ClientError as exc:
+        logger.error("Gemini API error in send_message_with_image: %s", exc)
+        return _friendly_api_error(exc)
     reply: str = response.text
     history.add_assistant(reply)
     return reply
@@ -202,7 +221,11 @@ async def call_claude(
             )
 
     cfg = _make_config(system_prompt, max_tokens)
-    response = await _client.aio.models.generate_content(
-        model=GEMINI_MODEL, contents=gemini_messages, config=cfg
-    )
+    try:
+        response = await _client.aio.models.generate_content(
+            model=GEMINI_MODEL, contents=gemini_messages, config=cfg
+        )
+    except genai_errors.ClientError as exc:
+        logger.error("Gemini API error in call_claude: %s", exc)
+        return _friendly_api_error(exc)
     return response.text.strip()

@@ -41,15 +41,26 @@ SHEET_RECEIVED = "Received Supplies"
 # Switch to gemini-1.5-pro for higher quality on complex reasoning tasks.
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-# ── Team ─────────────────────────────────────────────────────────────────────
-# Map Telegram user_id (int) -> researcher display name.
-# Add every lab member here so their name appears in Sheets / session reports.
-TEAM_MEMBERS: dict[int, str] = {
-    # 123456789: "Dr. Smith",
-    # 987654321: "Dr. Jones",
-}
+# ── Allowlist ─────────────────────────────────────────────────────────────────
+# Telegram user IDs allowed to use the bot.
+# Set ALLOWED_USER_IDS in .env as a comma-separated list, e.g.:
+#   ALLOWED_USER_IDS=123456789,987654321
+# Leave empty to allow everyone (not recommended for production).
+_raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS: set[int] = (
+    {int(x.strip()) for x in _raw_ids.split(",") if x.strip()}
+    if _raw_ids.strip()
+    else set()
+)
+
+
+def is_allowed(user_id: int) -> bool:
+    """Return True if this user is allowed. If allowlist is empty, allow all."""
+    if not ALLOWED_USER_IDS:
+        return True
+    return user_id in ALLOWED_USER_IDS
 
 
 def get_researcher_name(user_id: int) -> str:
-    """Return the researcher name for a Telegram user_id, or a fallback."""
-    return TEAM_MEMBERS.get(user_id, f"Researcher_{user_id}")
+    """Fallback name — prefer user_settings.get_researcher_name() which checks saved name first."""
+    return f"Researcher_{user_id}"
