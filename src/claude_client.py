@@ -299,7 +299,7 @@ async def send_message(
     history: ConversationHistory,
     user_text: str,
     system_prompt: Optional[str] = None,
-    max_tokens: int = 512,
+    max_tokens: int = 1024,
     notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> str:
     """Send a text message, update history, and return Gemini's reply."""
@@ -317,7 +317,7 @@ async def send_message_with_image(
     user_text: str,
     media_type: str = "image/jpeg",
     system_prompt: Optional[str] = None,
-    max_tokens: int = 512,
+    max_tokens: int = 1024,
     notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> str:
     """Send an image + text message, update history, and return Gemini's reply."""
