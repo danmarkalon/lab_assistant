@@ -247,15 +247,14 @@ class ProtocolSession:
     async def end_session(self) -> tuple[str, str]:
         """Close the session: generate summary, save to Google Doc, log to Lab Journal.
 
+        If the service account cannot create new Docs (e.g. zero storage quota),
+        the summary is still saved to the companion doc (if available) and the
+        Lab Journal sheet.
+
         Returns:
-            (summary_text, doc_url)
+            (summary_text, doc_url_or_empty)
         """
         summary = await self._generate_summary()
-
-        doc_title = (
-            f"{self.protocol_name} — {self.session_date} — {self.researcher_name}"
-        )
-        doc_id = await create_session_doc(doc_title, self.protocol_folder_id)
 
         report = (
             f"Protocol: {self.protocol_name}\n"
@@ -266,9 +265,28 @@ class ProtocolSession:
             f"\n{'=' * 60}\nSESSION SUMMARY\n{'=' * 60}\n\n"
             f"{summary}"
         )
-        await append_doc_text(doc_id, report)
 
-        doc_url = get_doc_url(doc_id)
+        # Try creating a dedicated session doc; fall back to companion doc.
+        doc_url = ""
+        doc_title = (
+            f"{self.protocol_name} — {self.session_date} — {self.researcher_name}"
+        )
+        try:
+            doc_id = await create_session_doc(doc_title, self.protocol_folder_id)
+            await append_doc_text(doc_id, report)
+            doc_url = get_doc_url(doc_id)
+        except Exception as exc:
+            logger.warning("Could not create session doc (%s), falling back to companion doc", exc)
+            # Append the report to the companion doc instead
+            if self.companion_doc_id:
+                try:
+                    separator = f"\n\n{'─' * 40}\n📋 SESSION REPORT — {self.session_date}\n{'─' * 40}\n\n"
+                    await append_doc_text(self.companion_doc_id, separator + report)
+                    doc_url = get_doc_url(self.companion_doc_id)
+                    logger.info("Session report appended to companion doc %s", doc_url)
+                except Exception as exc2:
+                    logger.error("Companion doc append also failed: %s", exc2)
+
         await append_sheet_row(
             SHEET_LAB_JOURNAL,
             [
@@ -283,5 +301,5 @@ class ProtocolSession:
             ],
         )
 
-        logger.info("Session ended: '%s' — report at %s", doc_title, doc_url)
+        logger.info("Session ended: '%s' — report at %s", doc_title, doc_url or "(no doc)")
         return summary, doc_url
