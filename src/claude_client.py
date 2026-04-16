@@ -207,7 +207,7 @@ async def _generate_with_fallback(
 
     Strategy:
     - Pacing: sleep _throttle_delay before each call (0 until first RPM hit).
-    - 503 (traffic spike): notify user, wait 10s, retry same model once.
+    - 503 (model overloaded): notify user once, cascade to next model immediately.
     - RPM 429: exponential backoff (1s → 2s → 4s, capped 60s), bump _throttle_delay
                to 4s for all future calls, then cascade to next model in chain.
     - Daily 429: immediate friendly error — no retry possible.
@@ -215,10 +215,11 @@ async def _generate_with_fallback(
     """
     global _throttle_delay
     last_exc: genai_errors.ClientError | None = None
+    notified = False
     backoff = 1.0
 
     for model in MODEL_CHAIN:
-        # Up to 3 attempts per model (handles transient 503s and a couple of RPM spikes)
+        # Up to 3 attempts per model for RPM backoff; 503 cascades immediately
         for attempt in range(3):
             if _throttle_delay > 0:
                 await asyncio.sleep(_throttle_delay)
@@ -237,24 +238,22 @@ async def _generate_with_fallback(
                     logger.warning("Daily quota hit on %s", model)
                     return _friendly_api_error(exc)
 
-                # 503 traffic spike — retry same model after 10s
+                # 503 — model is overloaded, cascade to next model immediately
                 if exc.code == 503:
-                    if attempt < 2:
-                        logger.warning("503 on %s attempt %d, retrying in 10s", model, attempt + 1)
-                        if attempt == 0 and notify_retry:
-                            await notify_retry()
-                        await asyncio.sleep(10)
-                        continue
-                    logger.warning("503 persists on %s after 3 attempts, cascading", model)
-                    break  # try next model
+                    logger.warning("503 on %s, cascading to next model", model)
+                    if not notified and notify_retry:
+                        notified = True
+                        await notify_retry()
+                    break  # cascade
 
-                # RPM quota — exponential backoff then cascade to next model
+                # RPM quota — exponential backoff, then cascade after 3 failures
                 if _is_rpm_error(exc):
                     wait = min(backoff, 60.0)
                     backoff = min(backoff * 2, 60.0)
                     _throttle_delay = max(_throttle_delay, 4.0)
                     logger.warning("RPM hit on %s, backoff %.0fs (throttle now %.0fs)", model, wait, _throttle_delay)
-                    if attempt == 0 and notify_retry:
+                    if not notified and notify_retry:
+                        notified = True
                         await notify_retry()
                     await asyncio.sleep(wait)
                     continue  # retry same model first, cascade after 3 failures
