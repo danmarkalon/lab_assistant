@@ -51,8 +51,7 @@ _FALLBACK_MODELS: list[str] = [
     "gemini-2.5-flash-lite",
 ]
 # Deduplicate while preserving order
-_seen: set[str] = set()
-MODEL_CHAIN: list[str] = [m for m in _FALLBACK_MODELS if not (_seen.add(m) or m in _seen)]  # type: ignore[func-returns-value]
+MODEL_CHAIN: list[str] = list(dict.fromkeys(_FALLBACK_MODELS))
 
 # Per-process pacing delay (seconds). 0 at startup; bumps to 4s on first RPM
 # hit so all subsequent calls are spaced to stay within 15 RPM.
@@ -236,6 +235,7 @@ async def _generate_with_fallback(
                 if _throttle_delay > 0:
                     await asyncio.sleep(_throttle_delay)
                 try:
+                    logger.debug("Trying model %s (pass %d, attempt %d)", model, chain_pass + 1, attempt + 1)
                     response = await _client.aio.models.generate_content(
                         model=model, contents=contents, config=config
                     )
@@ -246,6 +246,8 @@ async def _generate_with_fallback(
                     last_exc = exc
 
                     err_code = getattr(exc, 'code', 0)
+                    logger.warning("API error %d (%s) on %s pass %d attempt %d",
+                                   err_code, type(exc).__name__, model, chain_pass + 1, attempt + 1)
 
                     # Daily quota on this model — cascade to next, only stop if last
                     if _is_daily_error(exc):
@@ -277,6 +279,13 @@ async def _generate_with_fallback(
                     # Other error (auth, not-found, etc.) — fail immediately
                     logger.error("Gemini API error on %s: %s", model, exc)
                     return _friendly_api_error(exc)
+
+                except Exception as exc:
+                    # Unexpected error (SSL, connection, timeout, etc.)
+                    logger.error("Unexpected %s on %s pass %d attempt %d: %s",
+                                 type(exc).__name__, model, chain_pass + 1, attempt + 1, exc)
+                    last_exc = exc  # type: ignore[assignment]
+                    break  # cascade to next model
 
             # All attempts exhausted for this model — cascade
             if model != MODEL_CHAIN[-1]:
