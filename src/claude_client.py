@@ -59,17 +59,17 @@ MODEL_CHAIN: list[str] = [m for m in _FALLBACK_MODELS if not (_seen.add(m) or m 
 _throttle_delay: float = 0.0
 
 
-def _is_rpm_error(exc: genai_errors.ClientError) -> bool:
+def _is_rpm_error(exc: genai_errors.APIError) -> bool:
     """True for per-minute quota exhaustion (recoverable by slowing down)."""
-    return exc.code == 429 and "PerMinute" in str(exc)
+    return getattr(exc, 'code', 0) == 429 and "PerMinute" in str(exc)
 
 
-def _is_daily_error(exc: genai_errors.ClientError) -> bool:
+def _is_daily_error(exc: genai_errors.APIError) -> bool:
     """True for daily quota exhaustion (no recovery until tomorrow)."""
-    return exc.code == 429 and not _is_rpm_error(exc)
+    return getattr(exc, 'code', 0) == 429 and not _is_rpm_error(exc)
 
 
-def _parse_retry_delay(exc: genai_errors.ClientError) -> float:
+def _parse_retry_delay(exc: genai_errors.APIError) -> float:
     """Extract the server-suggested retry delay in seconds; default 30."""
     try:
         details = exc.args[1].get("error", {}).get("details", []) if exc.args else []
@@ -187,14 +187,15 @@ def _make_config(system_prompt: str, max_tokens: int) -> genai_types.GenerateCon
 # ── Gemini API calls ──────────────────────────────────────────────────────────
 
 
-def _friendly_api_error(exc: genai_errors.ClientError) -> str:
-    if exc.code == 429:
+def _friendly_api_error(exc: genai_errors.APIError) -> str:
+    code = getattr(exc, 'code', 0)
+    if code == 429:
         if _is_rpm_error(exc):
             return "⚠️ Too many requests per minute — slowing down. Please try again in a moment."
         return "⚠️ Daily AI quota reached. Please try again tomorrow, or ask the admin to enable billing."
-    if exc.code == 503:
+    if code == 503:
         return "⚠️ AI service temporarily unavailable. Please try again in a moment."
-    return f"⚠️ AI error ({exc.code}): {exc.message}"
+    return f"⚠️ AI error ({code}): {getattr(exc, 'message', str(exc))}"
 
 
 async def _generate_with_fallback(
@@ -213,7 +214,7 @@ async def _generate_with_fallback(
     - Other errors: immediate friendly error.
     """
     global _throttle_delay
-    last_exc: genai_errors.ClientError | None = None
+    last_exc: genai_errors.APIError | None = None
     notified = False
     backoff = 1.0
 
@@ -241,8 +242,10 @@ async def _generate_with_fallback(
                     if model != MODEL_CHAIN[0]:
                         logger.info("Succeeded on fallback model %s", model)
                     return response.text
-                except genai_errors.ClientError as exc:
+                except (genai_errors.ClientError, genai_errors.ServerError) as exc:
                     last_exc = exc
+
+                    err_code = getattr(exc, 'code', 0)
 
                     # Daily quota on this model — cascade to next, only stop if last
                     if _is_daily_error(exc):
@@ -252,7 +255,7 @@ async def _generate_with_fallback(
                         break  # try next model
 
                     # 503 — model is overloaded, cascade to next model immediately
-                    if exc.code == 503:
+                    if err_code == 503:
                         logger.warning("503 on %s, cascading to next model", model)
                         if not notified and notify_retry:
                             notified = True
