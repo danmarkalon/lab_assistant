@@ -40,11 +40,30 @@ _client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
 # Maximum number of conversation turns kept in rolling history.
-# Each turn = 1 user message + 1 model reply = 2 messages.
-# Keeping 10 turns caps per-request history at ~20 messages regardless of session length.
-# The full protocol + companion doc is always in the system_instruction, so the model
-# never loses protocol context — only old small-talk is trimmed.
 MAX_HISTORY_TURNS: int = 10
+
+# ── Rate-limit throttle ───────────────────────────────────────────────────────
+# Seconds to sleep before each Gemini call. Starts at 0; auto-bumps to 4s
+# (= 15 RPM pace) the first time an RPM quota error is returned, then stays
+# there for the lifetime of the process so all subsequent calls are spaced out.
+_throttle_delay: float = 0.0
+
+
+def _is_rpm_error(exc: genai_errors.ClientError) -> bool:
+    """True for per-minute quota exhaustion (recoverable by slowing down)."""
+    return exc.code == 429 and "PerMinute" in str(exc)
+
+
+def _parse_retry_delay(exc: genai_errors.ClientError) -> float:
+    """Extract the server-suggested retry delay in seconds; default 30."""
+    try:
+        details = exc.args[1].get("error", {}).get("details", []) if exc.args else []
+        for d in details:
+            if d.get("@type", "").endswith("RetryInfo"):
+                return float(d.get("retryDelay", "30s").rstrip("s"))
+    except Exception:
+        pass
+    return 30.0
 
 # ── Base system prompt ────────────────────────────────────────────────────────
 
@@ -156,10 +175,14 @@ def _make_config(system_prompt: str, max_tokens: int) -> genai_types.GenerateCon
 def _friendly_api_error(exc: genai_errors.ClientError) -> str:
     """Return a user-facing message for common Gemini API errors."""
     if exc.code == 429:
+        if _is_rpm_error(exc):
+            return "⚠️ Too many requests per minute — slowing down. Please try again in a moment."
         return (
-            "⚠️ The AI is temporarily unavailable — the free-tier quota has been reached. "
-            "Please try again in a few minutes, or contact the admin to enable billing."
+            "⚠️ Daily AI quota reached. "
+            "Please try again tomorrow, or ask the admin to enable billing."
         )
+    if exc.code == 503:
+        return "⚠️ AI service temporarily unavailable. Please try again in a moment."
     return f"⚠️ AI error ({exc.code}): {exc.message}"
 
 
@@ -174,6 +197,8 @@ async def send_message(
     history.add_user(user_text)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
     for attempt in range(2):
+        if _throttle_delay > 0:
+            await asyncio.sleep(_throttle_delay)
         try:
             response = await _client.aio.models.generate_content(
                 model=GEMINI_MODEL, contents=history.messages, config=cfg
@@ -182,12 +207,22 @@ async def send_message(
             history.add_assistant(reply)
             return reply
         except genai_errors.ClientError as exc:
-            if exc.code == 503 and attempt == 0:
-                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
-                if notify_retry:
-                    await notify_retry()
-                await asyncio.sleep(10)
-                continue
+            if attempt == 0:
+                if exc.code == 503:
+                    logger.warning("Gemini 503, retrying in 10s")
+                    if notify_retry:
+                        await notify_retry()
+                    await asyncio.sleep(10)
+                    continue
+                if _is_rpm_error(exc):
+                    global _throttle_delay
+                    retry_after = _parse_retry_delay(exc)
+                    _throttle_delay = max(_throttle_delay, 4.0)
+                    logger.warning("Gemini RPM hit — throttle set to %.0fs, waiting %.0fs", _throttle_delay, retry_after)
+                    if notify_retry:
+                        await notify_retry()
+                    await asyncio.sleep(retry_after)
+                    continue
             logger.error("Gemini API error in send_message: %s", exc)
             return _friendly_api_error(exc)
     return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
@@ -215,6 +250,8 @@ async def send_message_with_image(
     history.add_user(parts)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
     for attempt in range(2):
+        if _throttle_delay > 0:
+            await asyncio.sleep(_throttle_delay)
         try:
             response = await _client.aio.models.generate_content(
                 model=GEMINI_MODEL, contents=history.messages, config=cfg
@@ -223,12 +260,22 @@ async def send_message_with_image(
             history.add_assistant(reply)
             return reply
         except genai_errors.ClientError as exc:
-            if exc.code == 503 and attempt == 0:
-                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
-                if notify_retry:
-                    await notify_retry()
-                await asyncio.sleep(10)
-                continue
+            if attempt == 0:
+                if exc.code == 503:
+                    logger.warning("Gemini 503, retrying in 10s")
+                    if notify_retry:
+                        await notify_retry()
+                    await asyncio.sleep(10)
+                    continue
+                if _is_rpm_error(exc):
+                    global _throttle_delay
+                    retry_after = _parse_retry_delay(exc)
+                    _throttle_delay = max(_throttle_delay, 4.0)
+                    logger.warning("Gemini RPM hit — throttle set to %.0fs, waiting %.0fs", _throttle_delay, retry_after)
+                    if notify_retry:
+                        await notify_retry()
+                    await asyncio.sleep(retry_after)
+                    continue
             logger.error("Gemini API error in send_message_with_image: %s", exc)
             return _friendly_api_error(exc)
     return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
@@ -258,16 +305,26 @@ async def call_claude(
 
     cfg = _make_config(system_prompt, max_tokens)
     for attempt in range(2):
+        if _throttle_delay > 0:
+            await asyncio.sleep(_throttle_delay)
         try:
             response = await _client.aio.models.generate_content(
                 model=GEMINI_MODEL, contents=gemini_messages, config=cfg
             )
             return response.text.strip()
         except genai_errors.ClientError as exc:
-            if exc.code == 503 and attempt == 0:
-                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
-                await asyncio.sleep(10)
-                continue
+            if attempt == 0:
+                if exc.code == 503:
+                    logger.warning("Gemini 503 in call_claude, retrying in 10s")
+                    await asyncio.sleep(10)
+                    continue
+                if _is_rpm_error(exc):
+                    global _throttle_delay
+                    retry_after = _parse_retry_delay(exc)
+                    _throttle_delay = max(_throttle_delay, 4.0)
+                    logger.warning("Gemini RPM hit in call_claude — throttle %.0fs, waiting %.0fs", _throttle_delay, retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
             logger.error("Gemini API error in call_claude: %s", exc)
             return _friendly_api_error(exc)
     return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
