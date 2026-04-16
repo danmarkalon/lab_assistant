@@ -194,6 +194,7 @@ async def send_message(
     notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> str:
     """Send a text message, update history, and return Gemini's reply."""
+    global _throttle_delay
     history.add_user(user_text)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
     for attempt in range(2):
@@ -215,7 +216,6 @@ async def send_message(
                     await asyncio.sleep(10)
                     continue
                 if _is_rpm_error(exc):
-                    global _throttle_delay
                     retry_after = _parse_retry_delay(exc)
                     _throttle_delay = max(_throttle_delay, 4.0)
                     logger.warning("Gemini RPM hit — throttle set to %.0fs, waiting %.0fs", _throttle_delay, retry_after)
@@ -242,6 +242,7 @@ async def send_message_with_image(
     Supported image types: image/jpeg, image/png, image/gif, image/webp.
     Telegram photos arrive as JPEG.
     """
+    global _throttle_delay
     image_data = base64.b64encode(image_bytes).decode("utf-8")
     parts = [
         {"inline_data": {"mime_type": media_type, "data": image_data}},
@@ -268,7 +269,6 @@ async def send_message_with_image(
                     await asyncio.sleep(10)
                     continue
                 if _is_rpm_error(exc):
-                    global _throttle_delay
                     retry_after = _parse_retry_delay(exc)
                     _throttle_delay = max(_throttle_delay, 4.0)
                     logger.warning("Gemini RPM hit — throttle set to %.0fs, waiting %.0fs", _throttle_delay, retry_after)
@@ -292,6 +292,7 @@ async def call_claude(
     notes. Accepts both Gemini ("parts") and legacy Anthropic ("content") message
     formats so that protocol_skill.py needs no changes.
     """
+    global _throttle_delay
     gemini_messages = []
     for msg in messages:
         if "parts" in msg:
@@ -319,7 +320,6 @@ async def call_claude(
                     await asyncio.sleep(10)
                     continue
                 if _is_rpm_error(exc):
-                    global _throttle_delay
                     retry_after = _parse_retry_delay(exc)
                     _throttle_delay = max(_throttle_delay, 4.0)
                     logger.warning("Gemini RPM hit in call_claude — throttle %.0fs, waiting %.0fs", _throttle_delay, retry_after)
