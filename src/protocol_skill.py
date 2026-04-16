@@ -121,6 +121,7 @@ class ProtocolSession:
             file_name=protocol["docx_name"],
             modified_time=protocol.get("modifiedTime", ""),
             parent_folder_id=protocol.get("folder_id", ""),
+            folder_name=protocol.get("name", ""),
             is_gdoc=protocol.get("is_gdoc", False),
         )
 

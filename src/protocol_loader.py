@@ -57,6 +57,7 @@ async def load_protocol(
     file_name: str,
     modified_time: str,
     parent_folder_id: str = "",
+    folder_name: str = "",
     is_gdoc: bool = False,
 ) -> tuple[str, str, str, str, Optional[str]]:
     """Load a protocol from Drive and return all components for the skill.
@@ -76,11 +77,12 @@ async def load_protocol(
         protocol_text = extract_docx_text(docx_bytes)
         logger.info("Loaded protocol '%s' (%d chars)", protocol_name, len(protocol_text))
 
-    # Load companion knowledge doc if it exists
+    # Search companion using folder name (preferred) or file stem (fallback)
+    search_name = folder_name or protocol_name
     companion_text = ""
     companion_doc_id: Optional[str] = None
     try:
-        companion_doc_id = await find_companion_doc_id(protocol_name, parent_folder_id)
+        companion_doc_id = await find_companion_doc_id(search_name, parent_folder_id)
         if companion_doc_id:
             companion_text = await get_doc_text(companion_doc_id)
             logger.info(

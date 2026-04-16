@@ -172,31 +172,50 @@ async def download_docx(file_id: str) -> bytes:
     return await _run(_download_file_sync, file_id)
 
 
-def _find_companion_sync(protocol_stem: str, parent_folder_id: str) -> Optional[str]:
-    """Search for a companion knowledge Google Doc in the same folder as the protocol."""
+def _find_companion_sync(folder_name: str, parent_folder_id: str) -> Optional[str]:
+    """Search for a companion knowledge Google Doc in the protocol folder.
+
+    Tries two naming conventions:
+      1. {folder_name}_context   (preferred — matches folder name)
+      2. Any Google Doc whose name contains '_context'  (fallback)
+    """
     svc = _get_service("drive", "v3")
-    safe_stem = protocol_stem.replace("'", "\\'")
+
+    # Try exact folder-name convention first
+    safe = folder_name.replace("'", "\\'")
     q = (
         f"'{parent_folder_id}' in parents"
         " and mimeType='application/vnd.google-apps.document'"
-        f" and name contains '{safe_stem}_context'"
+        f" and name='{safe}_context'"
         " and trashed=false"
     )
     result = svc.files().list(q=q, fields="files(id, name)").execute()
     files = result.get("files", [])
-    return files[0]["id"] if files else None
+    if files:
+        return files[0]["id"]
+
+    # Fallback: any doc containing '_context' in this folder
+    q2 = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.document'"
+        " and name contains '_context'"
+        " and trashed=false"
+    )
+    result2 = svc.files().list(q=q2, fields="files(id, name)").execute()
+    files2 = result2.get("files", [])
+    return files2[0]["id"] if files2 else None
 
 
 async def find_companion_doc_id(
-    protocol_stem: str, parent_folder_id: str
+    folder_name: str, parent_folder_id: str
 ) -> Optional[str]:
     """Find the companion knowledge Google Doc for a protocol.
 
-    Searches in the same folder as the protocol .docx.
-    Naming convention: {protocol_stem}_context  (Google Doc)
+    Naming convention: {folder_name}_context  (Google Doc in the protocol folder)
+    Falls back to any doc containing '_context' in the folder.
     Returns doc_id or None.
     """
-    return await _run(_find_companion_sync, protocol_stem, parent_folder_id)
+    return await _run(_find_companion_sync, folder_name, parent_folder_id)
 
 
 # ── Drive — folder management ─────────────────────────────────────────────────
