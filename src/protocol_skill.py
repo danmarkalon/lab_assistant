@@ -94,6 +94,9 @@ class ProtocolSession:
         self.protocol_folder_id = protocol_folder_id
         self.history = ConversationHistory()
         self.session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Append-only log of key session events (deviations, notes, buffers).
+        # Used for summary generation so we don't pay for the full history.
+        self._event_log: list[str] = []
 
     @classmethod
     async def create(
@@ -164,6 +167,7 @@ class ProtocolSession:
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""
+        self._event_log.append(f"[DEVIATION] {description}")
         prompt = _DEVIATION_PREFIX.format(description=description)
         return await send_message(self.history, prompt, system_prompt=self.system_prompt)
 
@@ -206,11 +210,37 @@ class ProtocolSession:
     # ── Session end ───────────────────────────────────────────────────────────
 
     async def _generate_summary(self) -> str:
-        """Ask Claude to generate a structured summary from the session history."""
+        """Ask Gemini to generate a structured summary from the event log + recent history.
+
+        Uses a compact representation instead of full history to save tokens:
+        - Key events (deviations, notes, findings) from _event_log
+        - Last few turns of recent history for context
+        """
+        event_block = ""
+        if self._event_log:
+            event_block = "Key events this session:\n" + "\n".join(self._event_log) + "\n\n"
+
+        # Include last 6 messages (3 turns) from history for recent context
+        recent = self.history.messages[-6:] if len(self.history.messages) > 6 else self.history.messages
+        recent_block = ""
+        if recent:
+            lines = []
+            for msg in recent:
+                role = "Researcher" if msg["role"] == "user" else "Assistant"
+                text = " ".join(p.get("text", "") for p in msg["parts"] if isinstance(p, dict))
+                if text.strip():
+                    lines.append(f"{role}: {text.strip()[:300]}")
+            if lines:
+                recent_block = "Recent conversation (last 3 turns):\n" + "\n".join(lines) + "\n\n"
+
+        summary_request = (
+            f"{event_block}{recent_block}"
+            f"Researcher: {self.researcher_name}\n"
+            f"Objective: {self.objective}\n\n"
+            f"{_SUMMARY_INSTRUCTION}"
+        )
         return await call_claude(
-            messages=self.history.messages + [
-                {"role": "user", "content": _SUMMARY_INSTRUCTION}
-            ],
+            messages=[{"role": "user", "content": summary_request}],
             system_prompt=self.system_prompt,
             max_tokens=2048,
         )

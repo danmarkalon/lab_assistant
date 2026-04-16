@@ -391,6 +391,7 @@ async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return EXPERIMENT_ACTIVE
     buffer_name = " ".join(context.args) if context.args else "the buffer"
     await update.message.chat.send_action("typing")
+    session._event_log.append(f"[BUFFER PREP] {buffer_name}")
     prompt = (
         f"Buffer preparation request: {buffer_name}. "
         "Find the recipe in the protocol. "
@@ -427,6 +428,7 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return EXPERIMENT_ACTIVE
     await update.message.chat.send_action("typing")
     if session:
+        session._event_log.append(f"[NOTE] {note}")
         reply = await session.handle_message(f"Please record this note: {note}")
         await update.message.reply_text(f"📝 Note recorded:\n{reply}")
     else:

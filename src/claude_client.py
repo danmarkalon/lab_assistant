@@ -38,6 +38,13 @@ if _ca:
 _client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
+# Maximum number of conversation turns kept in rolling history.
+# Each turn = 1 user message + 1 model reply = 2 messages.
+# Keeping 10 turns caps per-request history at ~20 messages regardless of session length.
+# The full protocol + companion doc is always in the system_instruction, so the model
+# never loses protocol context — only old small-talk is trimmed.
+MAX_HISTORY_TURNS: int = 10
+
 # ── Base system prompt ────────────────────────────────────────────────────────
 
 BASE_SYSTEM_PROMPT = """\
@@ -70,6 +77,9 @@ class ConversationHistory:
     Gemini uses role="model" (not "assistant") and parts as a list of dicts:
       {"role": "user",  "parts": [{"text": "..."}, ...]}
       {"role": "model", "parts": [{"text": "..."}]}
+
+    History is automatically trimmed to MAX_HISTORY_TURNS after each complete
+    turn (user + model) to keep per-request token costs bounded.
     """
 
     def __init__(self) -> None:
@@ -84,6 +94,13 @@ class ConversationHistory:
 
     def add_assistant(self, text: str) -> None:
         self.messages.append({"role": "model", "parts": [{"text": text}]})
+        self._trim()
+
+    def _trim(self) -> None:
+        """Drop oldest turns so history never exceeds MAX_HISTORY_TURNS pairs."""
+        max_msgs = MAX_HISTORY_TURNS * 2
+        if len(self.messages) > max_msgs:
+            self.messages = self.messages[-max_msgs:]
 
     def clear(self) -> None:
         self.messages.clear()
@@ -149,7 +166,7 @@ async def send_message(
     history: ConversationHistory,
     user_text: str,
     system_prompt: Optional[str] = None,
-    max_tokens: int = 1024,
+    max_tokens: int = 512,
 ) -> str:
     """Send a text message, update history, and return Gemini's reply."""
     history.add_user(user_text)
@@ -172,7 +189,7 @@ async def send_message_with_image(
     user_text: str,
     media_type: str = "image/jpeg",
     system_prompt: Optional[str] = None,
-    max_tokens: int = 1024,
+    max_tokens: int = 512,
 ) -> str:
     """Send an image + text message, update history, and return Gemini's reply.
 
