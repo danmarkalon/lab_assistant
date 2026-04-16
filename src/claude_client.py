@@ -43,15 +43,14 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_TURNS: int = 10
 
 # ── Model fallback chain ──────────────────────────────────────────────────────
-# On RPM quota exhaustion the bot tries each model in order.
-# Each has its own separate free-tier quota pool, effectively stacking them.
-# Primary is taken from .env (GEMINI_MODEL). Fallbacks are tried in sequence.
+# Only models confirmed to have free-tier quota on this key.
+# gemini-2.5-flash: primary (best quality, occasionally 503s under high load)
+# gemini-2.5-flash-lite: reliable fallback with separate quota pool
 _FALLBACK_MODELS: list[str] = [
     GEMINI_MODEL,
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
 ]
-# Deduplicate while preserving order (in case GEMINI_MODEL is already in list)
+# Deduplicate while preserving order
 _seen: set[str] = set()
 MODEL_CHAIN: list[str] = [m for m in _FALLBACK_MODELS if not (_seen.add(m) or m in _seen)]  # type: ignore[func-returns-value]
 
@@ -245,10 +244,12 @@ async def _generate_with_fallback(
                 except genai_errors.ClientError as exc:
                     last_exc = exc
 
-                    # Daily quota — no point retrying any model
+                    # Daily quota on this model — cascade to next, only stop if last
                     if _is_daily_error(exc):
-                        logger.warning("Daily quota hit on %s", model)
-                        return _friendly_api_error(exc)
+                        logger.warning("Daily quota hit on %s, cascading", model)
+                        if model == MODEL_CHAIN[-1]:
+                            return _friendly_api_error(exc)
+                        break  # try next model
 
                     # 503 — model is overloaded, cascade to next model immediately
                     if exc.code == 503:
