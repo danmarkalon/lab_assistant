@@ -328,7 +328,8 @@ async def active_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if not session:
         return ConversationHandler.END
     await update.message.chat.send_action("typing")
-    reply = await session.handle_message(update.message.text)
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await session.handle_message(update.message.text, notify_retry=notify)
     await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
 
@@ -345,7 +346,8 @@ async def active_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     transcript = await transcribe_ogg(buf.getvalue())
 
     await update.message.reply_text(f"🎙️ _{transcript}_", parse_mode="Markdown")
-    reply = await session.handle_message(transcript)
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await session.handle_message(transcript, notify_retry=notify)
     await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
 
@@ -364,7 +366,8 @@ async def active_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         update.message.caption
         or "Describe this lab image. Extract any text, labels, or measurements visible."
     )
-    reply = await session.handle_message(caption, image_bytes=buf.getvalue())
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await session.handle_message(caption, image_bytes=buf.getvalue(), notify_retry=notify)
     await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
 
@@ -560,7 +563,8 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     history = _get_history(update.effective_user.id)
     await update.message.chat.send_action("typing")
-    reply = await send_message(history, update.message.text)
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await send_message(history, update.message.text, notify_retry=notify)
     await update.message.reply_text(reply)
 
 
@@ -574,7 +578,8 @@ async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     transcript = await transcribe_ogg(buf.getvalue())
     await update.message.reply_text(f"🎙️ _{transcript}_", parse_mode="Markdown")
     history = _get_history(update.effective_user.id)
-    reply = await send_message(history, transcript)
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await send_message(history, transcript, notify_retry=notify)
     await update.message.reply_text(reply)
 
 
@@ -590,7 +595,8 @@ async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         or "Describe this lab image. Extract any text, labels, or measurements visible."
     )
     history = _get_history(update.effective_user.id)
-    reply = await send_message_with_image(history, buf.getvalue(), caption)
+    notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
+    reply = await send_message_with_image(history, buf.getvalue(), caption, notify_retry=notify)
     await update.message.reply_text(reply)
 
 

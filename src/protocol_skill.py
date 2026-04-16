@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from .claude_client import (
     BASE_SYSTEM_PROMPT,
@@ -151,19 +151,18 @@ class ProtocolSession:
         self,
         text: str,
         image_bytes: Optional[bytes] = None,
+        notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> str:
-        """Route a text or image+text message through the Protocol Expert.
-
-        Updates conversation history so Claude retains full session context.
-        """
+        """Route a text or image+text message through the Protocol Expert."""
         if image_bytes:
             return await send_message_with_image(
                 self.history,
                 image_bytes,
                 text,
                 system_prompt=self.system_prompt,
+                notify_retry=notify_retry,
             )
-        return await send_message(self.history, text, system_prompt=self.system_prompt)
+        return await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""

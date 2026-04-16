@@ -15,9 +15,10 @@ Gemini message format differences from Anthropic:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -167,20 +168,29 @@ async def send_message(
     user_text: str,
     system_prompt: Optional[str] = None,
     max_tokens: int = 512,
+    notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> str:
     """Send a text message, update history, and return Gemini's reply."""
     history.add_user(user_text)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    try:
-        response = await _client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=history.messages, config=cfg
-        )
-    except genai_errors.ClientError as exc:
-        logger.error("Gemini API error in send_message: %s", exc)
-        return _friendly_api_error(exc)
-    reply: str = response.text
-    history.add_assistant(reply)
-    return reply
+    for attempt in range(2):
+        try:
+            response = await _client.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=history.messages, config=cfg
+            )
+            reply: str = response.text
+            history.add_assistant(reply)
+            return reply
+        except genai_errors.ClientError as exc:
+            if exc.code == 503 and attempt == 0:
+                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
+                if notify_retry:
+                    await notify_retry()
+                await asyncio.sleep(10)
+                continue
+            logger.error("Gemini API error in send_message: %s", exc)
+            return _friendly_api_error(exc)
+    return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
 
 
 async def send_message_with_image(
@@ -190,6 +200,7 @@ async def send_message_with_image(
     media_type: str = "image/jpeg",
     system_prompt: Optional[str] = None,
     max_tokens: int = 512,
+    notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> str:
     """Send an image + text message, update history, and return Gemini's reply.
 
@@ -203,16 +214,24 @@ async def send_message_with_image(
     ]
     history.add_user(parts)
     cfg = _make_config(system_prompt or BASE_SYSTEM_PROMPT, max_tokens)
-    try:
-        response = await _client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=history.messages, config=cfg
-        )
-    except genai_errors.ClientError as exc:
-        logger.error("Gemini API error in send_message_with_image: %s", exc)
-        return _friendly_api_error(exc)
-    reply: str = response.text
-    history.add_assistant(reply)
-    return reply
+    for attempt in range(2):
+        try:
+            response = await _client.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=history.messages, config=cfg
+            )
+            reply: str = response.text
+            history.add_assistant(reply)
+            return reply
+        except genai_errors.ClientError as exc:
+            if exc.code == 503 and attempt == 0:
+                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
+                if notify_retry:
+                    await notify_retry()
+                await asyncio.sleep(10)
+                continue
+            logger.error("Gemini API error in send_message_with_image: %s", exc)
+            return _friendly_api_error(exc)
+    return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
 
 
 async def call_claude(
@@ -238,11 +257,17 @@ async def call_claude(
             )
 
     cfg = _make_config(system_prompt, max_tokens)
-    try:
-        response = await _client.aio.models.generate_content(
-            model=GEMINI_MODEL, contents=gemini_messages, config=cfg
-        )
-    except genai_errors.ClientError as exc:
-        logger.error("Gemini API error in call_claude: %s", exc)
-        return _friendly_api_error(exc)
-    return response.text.strip()
+    for attempt in range(2):
+        try:
+            response = await _client.aio.models.generate_content(
+                model=GEMINI_MODEL, contents=gemini_messages, config=cfg
+            )
+            return response.text.strip()
+        except genai_errors.ClientError as exc:
+            if exc.code == 503 and attempt == 0:
+                logger.warning("Gemini 503 on attempt 1, retrying in 10s")
+                await asyncio.sleep(10)
+                continue
+            logger.error("Gemini API error in call_claude: %s", exc)
+            return _friendly_api_error(exc)
+    return _friendly_api_error(genai_errors.ClientError(503, {}, None))  # unreachable
