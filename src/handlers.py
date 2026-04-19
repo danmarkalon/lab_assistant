@@ -409,6 +409,7 @@ async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Ask me for the target final volume, then calculate the exact volumes and weights needed."
     )
     reply = await session.handle_message(prompt)
+    await session.log_buffer(buffer_name, reply)
     await update.message.reply_text(reply)
     return EXPERIMENT_ACTIVE
 
@@ -420,6 +421,7 @@ async def cmd_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     prompt = f"Lab calculation: {query}" if query else "I need help with a lab calculation."
     if session:
         reply = await session.handle_message(prompt)
+        await session.log_dilution(f"{query}: {reply}" if query else reply)
     else:
         history = _get_history(update.effective_user.id)
         reply = await send_message(history, prompt)
@@ -440,6 +442,7 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.chat.send_action("typing")
     if session:
         session._event_log.append(f"[NOTE] {note}")
+        await session.log_note(note)
         reply = await session.handle_message(f"Please record this note: {note}")
         await update.message.reply_text(f"📝 Note recorded:\n{reply}")
     else:
@@ -495,7 +498,9 @@ async def receive_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     await update.message.chat.send_action("typing")
     if context.user_data.pop("_note_mode", False):
-        reply = await session.handle_message(f"Please record this note: {update.message.text}")
+        note_text = update.message.text
+        await session.log_note(note_text)
+        reply = await session.handle_message(f"Please record this note: {note_text}")
         await update.message.reply_text(f"📝 {reply}")
     else:
         reply = await session.handle_refine(update.message.text)

@@ -186,32 +186,37 @@ class ProtocolSession:
             self._exp_tab_sheet_id = await create_experiment_tab(
                 self._exp_spreadsheet_id, self._exp_tab_title
             )
-            # Write header rows
+            # Write general info + section headers
             await append_experiment_rows(
                 self._exp_spreadsheet_id,
                 self._exp_tab_title,
                 [
+                    # ── General Info ──
+                    ["GENERAL INFO"],
                     ["Protocol", self.protocol_name],
                     ["Version", self.protocol_version],
                     ["Date", self.session_date],
                     ["Time", self.session_time],
                     ["Researcher", self.researcher_name],
                     ["Objective", self.objective],
-                    [],  # blank separator
-                    ["Time", "Type", "Content", "AI Response"],
+                    [],
+                    # ── Column headers for log entries ──
+                    ["Time", "Section", "Content"],
                 ],
             )
         except Exception as exc:
             logger.error("Failed to create experiment tab: %s", exc)
             self._exp_spreadsheet_id = None  # disable further writes
 
-    async def _sheet_append(self, rows: list[list]) -> None:
-        """Append rows to the experiment tab. Silently logs on failure."""
+    async def _sheet_log(self, section: str, content: str) -> None:
+        """Append a single structured row to the experiment tab."""
         if not self._exp_spreadsheet_id:
             return
+        ts = datetime.now(_TZ).strftime("%H:%M")
         try:
             await append_experiment_rows(
-                self._exp_spreadsheet_id, self._exp_tab_title, rows
+                self._exp_spreadsheet_id, self._exp_tab_title,
+                [[ts, section, content]],
             )
         except Exception as exc:
             logger.warning("Live-append to experiment sheet failed: %s", exc)
@@ -230,32 +235,40 @@ class ProtocolSession:
         image_bytes: Optional[bytes] = None,
         notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> str:
-        """Route a text or image+text message through the Protocol Expert."""
+        """Route a text or image+text message through the Protocol Expert.
+
+        Regular conversation is NOT logged to the experiment sheet — only
+        explicit notes, deviations, buffers, and dilutions are recorded.
+        """
         if image_bytes:
-            reply = await send_message_with_image(
+            return await send_message_with_image(
                 self.history,
                 image_bytes,
                 text,
                 system_prompt=self.system_prompt,
                 notify_retry=notify_retry,
             )
-        else:
-            reply = await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
-
-        # Live-append the exchange to the experiments sheet
-        ts = datetime.now(_TZ).strftime("%H:%M")
-        msg_type = "📷 Image + Text" if image_bytes else "💬 Message"
-        await self._sheet_append([[ts, msg_type, text, reply]])
-        return reply
+        return await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""
         self._event_log.append(f"[DEVIATION] {description}")
         prompt = _DEVIATION_PREFIX.format(description=description)
         reply = await send_message(self.history, prompt, system_prompt=self.system_prompt)
-        ts = datetime.now(_TZ).strftime("%H:%M")
-        await self._sheet_append([[ts, "⚠️ Deviation", description, reply]])
+        await self._sheet_log("⚠️ Deviation", description)
         return reply
+
+    async def log_note(self, note: str) -> None:
+        """Record a note to the experiment sheet."""
+        await self._sheet_log("📝 Note", note)
+
+    async def log_buffer(self, buffer_name: str, details: str) -> None:
+        """Record a buffer preparation to the experiment sheet."""
+        await self._sheet_log("🧪 Buffer Prep", f"{buffer_name}: {details}")
+
+    async def log_dilution(self, details: str) -> None:
+        """Record a dilution/calculation to the experiment sheet."""
+        await self._sheet_log("🔬 Dilution/Calc", details)
 
     # ── Knowledge refinement ──────────────────────────────────────────────────
 
@@ -340,12 +353,8 @@ class ProtocolSession:
         summary = await self._generate_summary()
 
         # Write summary to experiment sheet
-        ts = datetime.now(_TZ).strftime("%H:%M")
-        await self._sheet_append([
-            [],
-            [ts, "📋 Summary", summary],
-            [ts, "🔚 Session End", ""],
-        ])
+        await self._sheet_log("📋 Summary", summary)
+        await self._sheet_log("🔚 Session End", "")
 
         sheet_url = self.experiments_sheet_url
 
