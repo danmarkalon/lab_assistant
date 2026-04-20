@@ -39,6 +39,7 @@ def _patch_ssl() -> None:
 
 from .handlers import (
     build_conversation_handler,
+    build_project_handler,
     build_settings_handler,
     cmd_calculate,
     cmd_help,
@@ -72,20 +73,23 @@ def build_app():
     # 1. Experiment session conversation handler (highest priority)
     app.add_handler(build_conversation_handler())
 
-    # 2. Settings conversation handler
+    # 2. Open Project conversation handler (experiment database)
+    app.add_handler(build_project_handler())
+
+    # 3. Settings conversation handler
     app.add_handler(build_settings_handler())
 
-    # 3. Always-available command handlers
+    # 4. Always-available command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("calculate", cmd_calculate))
 
-    # 3. Fallback handlers for casual use outside experiment sessions
+    # 5. Fallback handlers for casual use outside experiment sessions
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
     app.add_handler(MessageHandler(filters.VOICE, fallback_voice))
     app.add_handler(MessageHandler(filters.PHOTO, fallback_photo))
 
-    # 4. Global error handler — catches any uncaught exception in a handler
+    # 6. Global error handler — catches any uncaught exception in a handler
     app.add_error_handler(_error_handler)
 
     return app

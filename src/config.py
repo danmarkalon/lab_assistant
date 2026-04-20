@@ -36,6 +36,12 @@ SHEET_LAB_JOURNAL = "Lab Journal"
 SHEET_STOCK_ORDERS = "Stock Orders"
 SHEET_RECEIVED = "Received Supplies"
 
+# ── ChromaDB ──────────────────────────────────────────────────────────────────
+CHROMA_DB_PATH: str = os.environ.get(
+    "CHROMA_DB_PATH",
+    str(Path(__file__).parent.parent / "chroma_db"),
+)
+
 # ── Gemini ────────────────────────────────────────────────────────────────────
 # gemini-2.0-flash: free tier (1500 req/day), 1M token context, vision + audio.
 # Switch to gemini-1.5-pro for higher quality on complex reasoning tasks.

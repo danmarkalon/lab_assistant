@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -237,18 +238,31 @@ class ProtocolSession:
     ) -> str:
         """Route a text or image+text message through the Protocol Expert.
 
-        Regular conversation is NOT logged to the experiment sheet — only
-        explicit notes, deviations, buffers, and dilutions are recorded.
+        Automatically detects [OBS: ...] tags in the AI response, logs them
+        to the event log and experiment sheet, and strips the tags from the
+        reply shown to the user.
         """
         if image_bytes:
-            return await send_message_with_image(
+            reply = await send_message_with_image(
                 self.history,
                 image_bytes,
                 text,
                 system_prompt=self.system_prompt,
                 notify_retry=notify_retry,
             )
-        return await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
+        else:
+            reply = await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
+
+        # Extract auto-detected observations
+        observations = re.findall(r"\[OBS:\s*(.+?)\]", reply)
+        for obs in observations:
+            self._event_log.append(f"[NOTE] {obs}")
+            await self._sheet_log("📝 Auto-Note", obs)
+
+        # Strip [OBS: ...] tags from the user-facing reply
+        clean_reply = re.sub(r"\s*\[OBS:\s*.+?\]\s*", "\n", reply).strip()
+
+        return clean_reply
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""
