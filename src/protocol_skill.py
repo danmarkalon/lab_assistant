@@ -38,6 +38,7 @@ from .google_client import (
     create_experiment_tab,
     find_experiments_sheet_id,
     get_sheet_url,
+    load_general_methods,
 )
 from .protocol_loader import load_protocol
 
@@ -152,11 +153,18 @@ class ProtocolSession:
         else:
             logger.warning("No experiments spreadsheet for '%s' — live logging disabled", folder_name)
 
+        # Load cross-method knowledge (cached after first call)
+        general_methods_text = await load_general_methods()
+
+        is_facs = "bone marrow" in folder_name.lower() and "facs" in folder_name.lower()
+
         system_prompt = build_system_prompt(
             protocol_text=protocol_text,
             companion_text=companion_text if companion_text.strip() else None,
             protocol_name=protocol_name,
             protocol_version=protocol_version,
+            general_methods_text=general_methods_text or None,
+            is_facs=is_facs,
         )
 
         session = cls(
@@ -187,27 +195,125 @@ class ProtocolSession:
             self._exp_tab_sheet_id = await create_experiment_tab(
                 self._exp_spreadsheet_id, self._exp_tab_title
             )
-            # Write general info + section headers
-            await append_experiment_rows(
-                self._exp_spreadsheet_id,
-                self._exp_tab_title,
-                [
-                    # ── General Info ──
-                    ["GENERAL INFO"],
-                    ["Protocol", self.protocol_name],
-                    ["Version", self.protocol_version],
-                    ["Date", self.session_date],
-                    ["Time", self.session_time],
-                    ["Researcher", self.researcher_name],
-                    ["Objective", self.objective],
-                    [],
-                    # ── Column headers for log entries ──
-                    ["Time", "Section", "Content"],
-                ],
-            )
+            # Use method-specific template if available
+            if self._is_facs_method():
+                await self._sheet_init_facs()
+            else:
+                await self._sheet_init_default()
         except Exception as exc:
             logger.error("Failed to create experiment tab: %s", exc)
             self._exp_spreadsheet_id = None  # disable further writes
+
+    def _is_facs_method(self) -> bool:
+        """Check if this session is a Bone Marrow FACS experiment."""
+        name = (self.folder_name or self.protocol_name).lower()
+        return "bone marrow" in name and "facs" in name
+
+    async def _sheet_init_default(self) -> None:
+        """Write the default experiment sheet header."""
+        await append_experiment_rows(
+            self._exp_spreadsheet_id,
+            self._exp_tab_title,
+            [
+                ["GENERAL INFO"],
+                ["Protocol", self.protocol_name],
+                ["Version", self.protocol_version],
+                ["Date", self.session_date],
+                ["Time", self.session_time],
+                ["Researcher", self.researcher_name],
+                ["Objective", self.objective],
+                [],
+                ["Time", "Section", "Content"],
+            ],
+        )
+
+    async def _sheet_init_facs(self) -> None:
+        """Write the FACS experiment sheet with structured layout.
+
+        Creates a lean template with headers and reference data.
+        The calculator agent populates sample table, plate layout,
+        and master mix sections via [CALC_DATA] blocks.
+        """
+        rows = [
+            # ── General Info ──
+            ["GENERAL INFO"],
+            ["Protocol", self.protocol_name],
+            ["Version", self.protocol_version],
+            ["Date", self.session_date],
+            ["Time", self.session_time],
+            ["Researcher", self.researcher_name],
+            ["Objective", self.objective],
+            [],
+            # ── FACs Plate Layout (header only — bot fills via CALC_DATA) ──
+            ["FACs PLATE LAYOUT"],
+            ["(Will be populated by calculator agent based on treatment groups)"],
+            [],
+            # ── Sample Table (header only — bot fills via CALC_DATA) ──
+            ["SAMPLE TABLE"],
+            ["sample type", "Treatment", "Fraction", "IF condition",
+             "Expected cells", "Actual cells", "Volume (µL)", "Resuspension vol", "Comments"],
+            [],
+            # ── Antibody Reference ──
+            ["ANTIBODY PANEL"],
+            ["Abs", "Fluorophore", "vol/1×10⁶ cells (µL)", "Laser", "Detector"],
+            ["Biotin (Anti-lineage)", "Vio-Bright", "0.5", "488", "525-40"],
+            ["SCA1", "PerCP-Vio 770", "2", "488", "690-50"],
+            ["CD117", "PE", "2", "561", "585-42"],
+            ["CD16/CD32", "PE-Vio", "2", "561", "610-20"],
+            ["CD105", "PE-Vio770", "2", "561", "780-60"],
+            ["CD41", "APC-Vio770", "2", "638", "780-60"],
+            ["CD150", "BV605", "2", "405", "525-40"],
+            ["SNIPER", "AF647", "use on origin only", "638", "660-10"],
+            [],
+            ["IgG ISOTYPE CONTROLS"],
+            ["PE", "2 µL/1×10⁶"],
+            ["PerCP-Vio700", "2 µL/1×10⁶"],
+            ["PE-Vio770", "2 µL/1×10⁶"],
+            ["APC-Vio770", "2 µL/1×10⁶"],
+            [],
+            # ── Master Mix (header only — bot fills via CALC_DATA) ──
+            ["ANTIBODY MASTER MIX — ALL AB POOL"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            ["IgG CONTROL POOL"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            ["LIN(+) TUBES"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            # ── Zombie Staining (header only — bot fills via CALC_DATA) ──
+            ["ZOMBIE STAINING"],
+            ["(Calculator will compute based on number of samples)"],
+            [],
+            # ── Calculator Results ──
+            ["CALCULATOR RESULTS"],
+            [],
+            # ── Session Log ──
+            ["SESSION LOG"],
+            ["Time", "Section", "Content"],
+        ]
+        await append_experiment_rows(
+            self._exp_spreadsheet_id, self._exp_tab_title, rows,
+        )
+
+    async def _write_calc_table(self, calc_lines: list[str]) -> None:
+        """Write calculator results to the experiment sheet.
+
+        calc_lines: list of pipe-separated strings from [CALC_DATA] blocks.
+        Each line is split on '|' into columns.
+        """
+        if not self._exp_spreadsheet_id:
+            return
+        rows = []
+        for line in calc_lines:
+            cells = [c.strip() for c in line.split("|")]
+            if any(cells):
+                rows.append(cells)
+        if rows:
+            await self._sheet_log("🧮 Calculator", f"Added {len(rows)} rows")
+            await append_experiment_rows(
+                self._exp_spreadsheet_id, self._exp_tab_title, rows,
+            )
 
     async def _sheet_log(self, section: str, content: str) -> None:
         """Append a single structured row to the experiment tab."""
@@ -259,8 +365,22 @@ class ProtocolSession:
             self._event_log.append(f"[NOTE] {obs}")
             await self._sheet_log("📝 Auto-Note", obs)
 
-        # Strip [OBS: ...] tags from the user-facing reply
+        # Extract and write calculator data blocks to experiment sheet
+        calc_blocks = re.findall(
+            r"\[CALC_DATA\]\s*\n(.*?)(?:\[/CALC_DATA\]|\Z)",
+            reply, re.DOTALL,
+        )
+        for block in calc_blocks:
+            lines = [l.strip() for l in block.strip().splitlines() if l.strip()]
+            if lines:
+                await self._write_calc_table(lines)
+
+        # Strip [OBS: ...] tags and [CALC_DATA] blocks from the user-facing reply
         clean_reply = re.sub(r"\s*\[OBS:\s*.+?\]\s*", "\n", reply).strip()
+        clean_reply = re.sub(
+            r"\s*\[CALC_DATA\]\s*\n.*?(?:\[/CALC_DATA\]|\Z)",
+            "\n", clean_reply, flags=re.DOTALL,
+        ).strip()
 
         return clean_reply
 

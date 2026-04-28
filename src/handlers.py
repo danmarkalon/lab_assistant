@@ -66,6 +66,50 @@ logger = logging.getLogger(__name__)
 
 _TZ = ZoneInfo("Asia/Jerusalem")
 
+
+# ── Telegram-safe formatting ──────────────────────────────────────────────────
+
+def _to_telegram_html(text: str) -> str:
+    """Convert LLM markdown output to Telegram-compatible HTML.
+
+    Handles: **bold**, *italic*, `code`, ```code blocks```, headers (### ),
+    bullet points (- or *), and escapes HTML entities.
+    Falls back to plain text if conversion would break.
+    """
+    # First escape HTML entities in the raw text
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Code blocks (``` ... ```) → <pre>
+    text = re.sub(r"```(?:\w*)\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
+
+    # Inline code (`...`) → <code>
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+
+    # Bold: **text** → <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    # Italic: *text* → <i>text</i>  (but not bullet points at line start)
+    text = re.sub(r"(?<!\n)(?<!^)\*([^*\n]+?)\*", r"<i>\1</i>", text)
+
+    # Headers: ### text → bold with line break
+    text = re.sub(r"^#{1,4}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # Bullet points: leading "- " or "* " → "• "
+    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+
+    return text
+
+
+async def _send_reply(message, text: str) -> None:
+    """Send a bot reply with HTML formatting, falling back to plain text."""
+    html = _to_telegram_html(text)
+    try:
+        await message.reply_text(html, parse_mode="HTML")
+    except Exception:
+        # If HTML parse fails, send as plain text (strip leftover tags)
+        plain = re.sub(r"<[^>]+>", "", html)
+        await message.reply_text(plain)
+
 # ── Conversation state constants ──────────────────────────────────────────────
 
 PROTOCOL_SELECT     = 0
@@ -436,7 +480,7 @@ async def project_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     history = proj["history"]
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await send_message(history, transcript, system_prompt=proj["system_prompt"], notify_retry=notify)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
     return PROJECT_ACTIVE
 
 
@@ -656,7 +700,7 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     kb_text = (
         "📚 Knowledge base: loaded ✅" if session.companion_doc_id
-        else "📚 Knowledge base: none yet (create a `_context` Google Doc to start one)"
+        else "📚 Knowledge base: none yet (create a `method_support` Google Doc in the method folder)"
     )
     exp_text = (
         f"📝 Live experiment log: [open sheet]({session.experiments_sheet_url})" if session._exp_spreadsheet_id
@@ -695,9 +739,13 @@ async def active_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if not session:
         return ConversationHandler.END
     await update.message.chat.send_action("typing")
+    user_text = update.message.text
+    user_name = update.effective_user.first_name or "User"
+    logger.info("[SESSION %s] %s: %s", session.protocol_name, user_name, user_text[:300])
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
-    reply = await session.handle_message(update.message.text, notify_retry=notify)
-    await update.message.reply_text(reply)
+    reply = await session.handle_message(user_text, notify_retry=notify)
+    logger.info("[SESSION %s] BOT: %s", session.protocol_name, reply[:500])
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -713,6 +761,7 @@ async def active_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     transcript = await transcribe_ogg(buf.getvalue())
 
     await update.message.reply_text(f"🎙️ _{transcript}_", parse_mode="Markdown")
+    logger.info("[SESSION %s] %s (voice): %s", session.protocol_name, update.effective_user.first_name or "User", transcript[:300])
 
     # Check for "open project" trigger in transcript
     result = await _handle_open_project(update, context, transcript)
@@ -721,7 +770,8 @@ async def active_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await session.handle_message(transcript, notify_retry=notify)
-    await update.message.reply_text(reply)
+    logger.info("[SESSION %s] BOT: %s", session.protocol_name, reply[:500])
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -739,9 +789,11 @@ async def active_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         update.message.caption
         or "Describe this lab image. Extract any text, labels, or measurements visible."
     )
+    logger.info("[SESSION %s] %s (photo): %s", session.protocol_name, update.effective_user.first_name or "User", caption[:200])
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await session.handle_message(caption, image_bytes=buf.getvalue(), notify_retry=notify)
-    await update.message.reply_text(reply)
+    logger.info("[SESSION %s] BOT: %s", session.protocol_name, reply[:500])
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -775,7 +827,7 @@ async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     reply = await session.handle_message(prompt)
     await session.log_buffer(buffer_name, reply)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -790,7 +842,7 @@ async def cmd_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     else:
         history = _get_history(update.effective_user.id)
         reply = await send_message(history, prompt)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -850,7 +902,7 @@ async def receive_deviation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     await update.message.chat.send_action("typing")
     reply = await session.handle_deviation(update.message.text)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -866,10 +918,10 @@ async def receive_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         note_text = update.message.text
         await session.log_note(note_text)
         reply = await session.handle_message(f"Please record this note: {note_text}")
-        await update.message.reply_text(f"📝 {reply}")
+        await _send_reply(update.message, f"📝 {reply}")
     else:
         reply = await session.handle_refine(update.message.text)
-        await update.message.reply_text(reply)
+        await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
 
 
@@ -963,9 +1015,12 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     history = _get_history(update.effective_user.id)
     await update.message.chat.send_action("typing")
+    user_name = update.effective_user.first_name or "User"
+    logger.info("[CHAT] %s: %s", user_name, update.message.text[:300])
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await send_message(history, update.message.text, notify_retry=notify)
-    await update.message.reply_text(reply)
+    logger.info("[CHAT] BOT: %s", reply[:500])
+    await _send_reply(update.message, reply)
 
 
 async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -980,7 +1035,7 @@ async def fallback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = _get_history(update.effective_user.id)
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await send_message(history, transcript, notify_retry=notify)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
 
 
 async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -997,7 +1052,7 @@ async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = _get_history(update.effective_user.id)
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
     reply = await send_message_with_image(history, buf.getvalue(), caption, notify_retry=notify)
-    await update.message.reply_text(reply)
+    await _send_reply(update.message, reply)
 
 
 # ── /settings ─────────────────────────────────────────────────────────────────

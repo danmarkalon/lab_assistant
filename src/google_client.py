@@ -3,13 +3,14 @@ Google API client — Drive, Sheets, Docs.
 
 Drive folder layout expected:
   Lab Assistant/                  ← DRIVE_ROOT_FOLDER_ID
-  ├── Cell Fractionation/         ← one subfolder per protocol
-  │   ├── protocol.docx           ← the protocol file (first .docx found)
-  │   ├── protocol_context        ← optional companion knowledge Google Doc
-  │   └── experiments/            ← auto-created; one session doc per run
-  │       └── YYYY-MM-DD — Protocol — Researcher
-  ├── Another Protocol/
+  ├── Cell Fractionation/         ← one subfolder per method
+  │   ├── database/               ← reference docs, protocols, calculation sheets
+  │   ├── method_support          ← companion knowledge Google Doc (loaded into AI context)
+  │   └── experiments             ← Google Sheet with per-session tabs
+  ├── Another Method/
   │   └── ...
+  ├── general protocols/          ← shared skills (BCA, Jess, SOPs, buffers)
+  │   └── general_methods_assistant  ← cross-method knowledge (loaded into every session)
   └── Lab Assistant (Sheets)      ← general experiment tracking
 
 Authentication: Google Service Account (headless — no browser OAuth).
@@ -22,6 +23,7 @@ import asyncio
 import functools
 import io
 import logging
+from pathlib import Path
 from typing import Optional
 
 from google.oauth2 import service_account
@@ -156,6 +158,68 @@ async def list_protocols() -> list[dict]:
     return await _run(_list_protocol_folders_sync)
 
 
+# ── General methods assistant (cross-method knowledge) ────────────────────────
+
+_general_methods_cache: Optional[str] = None
+
+
+def _load_general_methods_sync() -> str:
+    """Load the general_methods_assistant content.
+
+    Tries Google Drive first (Google Doc in 'general protocols' folder),
+    then falls back to a local file at project root.
+    """
+    global _general_methods_cache
+    if _general_methods_cache is not None:
+        return _general_methods_cache
+
+    svc = _get_service("drive", "v3")
+
+    # Find 'general protocols' folder
+    q = (
+        f"'{DRIVE_ROOT_FOLDER_ID}' in parents"
+        " and mimeType='application/vnd.google-apps.folder'"
+        " and name='general protocols'"
+        " and trashed=false"
+    )
+    result = svc.files().list(q=q, fields="files(id)").execute()
+    folders = result.get("files", [])
+
+    if folders:
+        gp_id = folders[0]["id"]
+        # Find general_methods_assistant doc
+        q2 = (
+            f"'{gp_id}' in parents"
+            " and mimeType='application/vnd.google-apps.document'"
+            " and name='general_methods_assistant'"
+            " and trashed=false"
+        )
+        result2 = svc.files().list(q=q2, fields="files(id)").execute()
+        files = result2.get("files", [])
+        if files:
+            text = _read_doc_sync(files[0]["id"])
+            _general_methods_cache = text
+            logger.info("Loaded general_methods_assistant from Drive (%d chars)", len(text))
+            return text
+
+    # Fallback: local file at project root
+    local_path = Path(__file__).parent.parent / "general_methods_assistant.md"
+    if local_path.exists():
+        text = local_path.read_text(encoding="utf-8")
+        _general_methods_cache = text
+        logger.info("Loaded general_methods_assistant from local file (%d chars)", len(text))
+        return text
+
+    logger.warning("general_methods_assistant not found (Drive or local)")
+    _general_methods_cache = ""
+    return ""
+
+
+async def load_general_methods() -> str:
+    """Load the cross-method knowledge doc. Cached after first call."""
+    return await _run(_load_general_methods_sync)
+
+
 def _download_file_sync(file_id: str) -> bytes:
     svc = _get_service("drive", "v3")
     buf = io.BytesIO()
@@ -175,13 +239,27 @@ async def download_docx(file_id: str) -> bytes:
 def _find_companion_sync(folder_name: str, parent_folder_id: str) -> Optional[str]:
     """Search for a companion knowledge Google Doc in the protocol folder.
 
-    Tries two naming conventions:
-      1. {folder_name}_context   (preferred — matches folder name)
-      2. Any Google Doc whose name contains '_context'  (fallback)
+    Tries naming conventions in order:
+      1. 'method_support'             (new architecture — shared across methods)
+      2. {folder_name}_context        (legacy — matches folder name)
+      3. Any Google Doc containing '_context' in name  (legacy fallback)
     """
     svc = _get_service("drive", "v3")
 
-    # Try exact folder-name convention first
+    # Try 'method_support' first (new architecture)
+    q_ms = (
+        f"'{parent_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.document'"
+        " and name='method_support'"
+        " and trashed=false"
+    )
+    result_ms = svc.files().list(q=q_ms, fields="files(id, name)").execute()
+    files_ms = result_ms.get("files", [])
+    if files_ms:
+        logger.info("Found method_support doc (id=%s) in folder %s", files_ms[0]["id"], parent_folder_id)
+        return files_ms[0]["id"]
+
+    # Legacy: try exact folder-name convention
     safe = folder_name.replace("'", "\\'")
     q = (
         f"'{parent_folder_id}' in parents"
@@ -194,7 +272,7 @@ def _find_companion_sync(folder_name: str, parent_folder_id: str) -> Optional[st
     if files:
         return files[0]["id"]
 
-    # Fallback: any doc containing '_context' in this folder
+    # Legacy fallback: any doc containing '_context' in this folder
     q2 = (
         f"'{parent_folder_id}' in parents"
         " and mimeType='application/vnd.google-apps.document'"
@@ -211,8 +289,7 @@ async def find_companion_doc_id(
 ) -> Optional[str]:
     """Find the companion knowledge Google Doc for a protocol.
 
-    Naming convention: {folder_name}_context  (Google Doc in the protocol folder)
-    Falls back to any doc containing '_context' in the folder.
+    Tries: 'method_support' (new) → '{folder}_context' → any '_context' doc.
     Returns doc_id or None.
     """
     return await _run(_find_companion_sync, folder_name, parent_folder_id)

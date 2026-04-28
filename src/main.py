@@ -18,23 +18,22 @@ import logging
 import os
 import traceback
 
+# ── SSL patch — must run BEFORE any library that uses httpx/certifi is imported.
+_ca_bundle = os.environ.get("HTTPLIB2_CA_CERTS") or os.environ.get("SSL_CERT_FILE")
+if _ca_bundle:
+    os.environ.setdefault("SSL_CERT_FILE", _ca_bundle)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca_bundle)
+    try:
+        import certifi
+        certifi.where = lambda: _ca_bundle  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
 import nest_asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import TELEGRAM_BOT_TOKEN
-
-
-def _patch_ssl() -> None:
-    """Point certifi (used by httpx) at the system CA bundle when running behind
-    a corporate proxy that injects a self-signed cert into TLS chains."""
-    ca_bundle = os.environ.get("HTTPLIB2_CA_CERTS") or os.environ.get("SSL_CERT_FILE")
-    if ca_bundle:
-        try:
-            import certifi
-            certifi.where = lambda: ca_bundle  # type: ignore[method-assign]
-        except ImportError:
-            pass
 
 
 from .handlers import (
@@ -106,7 +105,6 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def run() -> None:
     """Start the bot. Works from the command line and from a Jupyter notebook."""
-    _patch_ssl()
     nest_asyncio.apply()
     app = build_app()
     logger.info("Lab Assistant Phase 2 starting — polling for updates...")
