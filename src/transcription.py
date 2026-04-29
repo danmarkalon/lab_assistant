@@ -8,10 +8,12 @@ handles everything.
 Supports any spoken language; Gemini auto-detects and transcribes faithfully.
 """
 
+import asyncio
 import base64
 import logging
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
@@ -27,9 +29,13 @@ if _ca:
 _client = genai.Client(api_key=GEMINI_API_KEY)
 logger = logging.getLogger(__name__)
 
+_FALLBACK_MODELS = [GEMINI_MODEL, "gemini-2.5-flash-lite"]
+
 
 async def transcribe_ogg(ogg_bytes: bytes) -> str:
     """Transcribe an OGG Opus voice message using Gemini.
+
+    Retries on 503 errors and falls back to lite model.
 
     Args:
         ogg_bytes: Raw bytes of the .ogg voice file downloaded from Telegram.
@@ -43,19 +49,36 @@ async def transcribe_ogg(ogg_bytes: bytes) -> str:
             data=base64.b64encode(ogg_bytes).decode("utf-8"),
         )
     )
-    response = await _client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            genai_types.Content(
-                role="user",
-                parts=[
-                    audio_part,
-                    genai_types.Part(text=(
-                        "Transcribe this audio accurately. "
-                        "Output only the transcribed text, nothing else."
-                    )),
-                ],
-            )
-        ],
-    )
-    return response.text.strip()
+    contents = [
+        genai_types.Content(
+            role="user",
+            parts=[
+                audio_part,
+                genai_types.Part(text=(
+                    "Transcribe this audio accurately. "
+                    "Output only the transcribed text, nothing else."
+                )),
+            ],
+        )
+    ]
+
+    last_exc = None
+    for model in _FALLBACK_MODELS:
+        for attempt in range(2):
+            try:
+                response = await _client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                )
+                return response.text.strip()
+            except genai_errors.ServerError as exc:
+                last_exc = exc
+                logger.warning("Transcription 503 on %s attempt %d", model, attempt + 1)
+                if attempt == 0:
+                    await asyncio.sleep(3)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Transcription error on %s: %s", model, exc)
+                break  # non-retryable, try next model
+
+    raise last_exc or RuntimeError("All transcription models failed")

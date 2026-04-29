@@ -64,7 +64,9 @@ async def load_protocol(
 
     Supports both .docx files and native Google Docs.
     """
-    protocol_name = os.path.splitext(file_name)[0]
+    # Use folder name as protocol name when the file itself is just "method_support"
+    raw_name = os.path.splitext(file_name)[0]
+    protocol_name = folder_name if (folder_name and raw_name == "method_support") else raw_name
     mod_date = modified_time[:10] if modified_time else "unknown"
     protocol_version = f"{file_name} (modified {mod_date})"
 
@@ -77,13 +79,20 @@ async def load_protocol(
         protocol_text = extract_docx_text(docx_bytes)
         logger.info("Loaded protocol '%s' (%d chars)", protocol_name, len(protocol_text))
 
-    # Search companion using folder name (preferred) or file stem (fallback)
+    # Search companion using folder name (preferred) or file stem (fallback).
+    # Skip companion search if the protocol file IS the method_support doc
+    # (otherwise we'd double-load the same document).
     search_name = folder_name or protocol_name
     companion_text = ""
     companion_doc_id: Optional[str] = None
+    _is_method_support = file_name.lower().replace(" ", "_") in ("method_support",)
+    if _is_method_support:
+        logger.info("Protocol IS method_support — skipping companion search")
+        companion_doc_id = file_id  # keep ID for /refine appending
     try:
-        companion_doc_id = await find_companion_doc_id(search_name, parent_folder_id)
-        if companion_doc_id:
+        if not _is_method_support:
+            companion_doc_id = await find_companion_doc_id(search_name, parent_folder_id)
+        if companion_doc_id and not _is_method_support:
             companion_text = await get_doc_text(companion_doc_id)
             logger.info(
                 "Loaded companion doc for '%s' (%d chars)", protocol_name, len(companion_text)

@@ -83,7 +83,7 @@ def _parse_retry_delay(exc: genai_errors.APIError) -> float:
 
 BASE_SYSTEM_PROMPT = """\
 You are a highly skilled lab assistant specializing in molecular biology and cell biology.
-You are supporting a researcher during active bench work.
+You are supporting a researcher during active bench work via Telegram on a small phone screen.
 
 Your responsibilities:
 - Answer questions about protocols precisely, citing the relevant step when possible.
@@ -93,6 +93,29 @@ exact volumes and weights for the researcher's target amount.
 - Help with lab calculations: dilutions (C1V1 = C2V2), molarity, stock solution prep, \
 unit conversions.
 - Flag potential issues or known failure points when you are aware of them.
+
+Formatting rules (CRITICAL — the researcher reads your replies on a small phone screen):
+- Keep replies SHORT. Skip pleasantries, filler, and restatements.
+- Use plain text by default. Only bold a word with **word** when it truly needs emphasis.
+- NEVER use nested formatting like ***text*** or **_text_**.
+- Use line breaks generously to separate sections — whitespace aids readability.
+- For lists, use simple lines with a dash or bullet, one item per line.
+- For tables/data, use one value per line with a clear label:
+    Lin(-): 2.785×10⁶ in 1mL
+    Origin: 4.4×10⁶ in 200µL
+- For calculations, show: formula → result. One line each.
+- NO long paragraphs. If a paragraph exceeds 3 lines, break it up.
+- Use emoji sparingly for section markers (⚠️ for warnings, ✅ for done).
+
+Observation tagging:
+When the researcher mentions a factual observation about the experiment — such as cell \
+confluency, cell origin/passage, reagent appearance, timing, temperature readings, pH, \
+color changes, unexpected results, or any concrete detail worth recording — include an \
+observation tag in your reply on its own line:
+[OBS: <one-sentence factual note of what the researcher reported>]
+Only tag genuine experimental observations, NOT questions, greetings, or commands. \
+You may include multiple [OBS: ...] tags if several observations are mentioned. \
+Continue your normal reply around the tag(s).
 
 Rules:
 - Always respond in English, regardless of the language used in the input.
@@ -151,9 +174,18 @@ def build_system_prompt(
     companion_text: Optional[str] = None,
     protocol_name: Optional[str] = None,
     protocol_version: Optional[str] = None,
+    general_methods_text: Optional[str] = None,
+    is_facs: bool = False,
 ) -> str:
     """Assemble a system prompt, optionally embedding a protocol + companion knowledge."""
     parts = [BASE_SYSTEM_PROMPT]
+
+    if general_methods_text:
+        parts.append(
+            "\n=== GENERAL LABORATORY METHODS ===\n"
+            "(Cross-method knowledge: buffers, BCA, Jess Western, SOPs)\n"
+            f"{general_methods_text}"
+        )
 
     if protocol_text:
         header = f"=== PROTOCOL: {protocol_name or 'Unknown'}"
@@ -164,12 +196,46 @@ def build_system_prompt(
 
     if companion_text:
         parts.append(
-            "\n=== PROTOCOL KNOWLEDGE BASE ===\n"
-            "(Accumulated notes, rationale, and known issues from previous runs)\n"
+            "\n=== METHOD-SPECIFIC KNOWLEDGE BASE ===\n"
+            "(Development history, expert notes, and known issues for this method)\n"
             f"{companion_text}"
         )
 
+    if is_facs:
+        parts.append(_FACS_CALCULATOR_PROMPT)
+
     return "\n\n".join(parts)
+
+
+# ── FACS Calculator Prompt ────────────────────────────────────────────────────
+
+_FACS_CALCULATOR_PROMPT = """\
+=== FACS CELL DATA EXTRACTION ===
+
+When the researcher provides cell count data (from photos, text, or voice),
+extract it into a [CELL_DATA] block. The system calculates everything automatically.
+
+FORMAT (pipe-separated, one line per fraction):
+[CELL_DATA]
+Treatment | Fraction | Concentration (cells/mL) | Volume (mL)
+PBS | Origin | 5e6 | 1
+PBS | Lin(-) | 2e6 | 3
+PBS | Lin(+) | 50e6 | 5
+5mg/kg | Origin | 6e6 | 2
+5mg/kg | Lin(-) | 5.5e6 | 5
+5mg/kg | Lin(+) | 46e6 | 2
+[/CELL_DATA]
+
+RULES:
+- Use scientific notation for concentration: 5e6 = 5×10⁶
+- Concentration in cells/mL, volume in mL
+- Fractions must be exactly: Origin, Lin(-), Lin(+)
+- Include ALL treatment groups and ALL fractions
+- First line after [CELL_DATA] is the header — include it exactly as shown
+- Do NOT calculate antibody volumes, master mixes, or plate layouts — the system does this
+- If data is unclear or incomplete, ASK the researcher to clarify
+- ALWAYS output [CELL_DATA] when cell count information is available
+"""
 
 
 # ── Internal helper ───────────────────────────────────────────────────────────

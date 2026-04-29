@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -30,6 +31,12 @@ from .claude_client import (
     send_message_with_image,
 )
 from .config import SHEET_LAB_JOURNAL
+from .facs_calculator import (
+    compute_facs,
+    format_sheet_rows,
+    format_telegram_summary,
+    parse_cell_data,
+)
 from .google_client import (
     append_doc_text,
     append_experiment_rows,
@@ -37,8 +44,10 @@ from .google_client import (
     create_experiment_tab,
     find_experiments_sheet_id,
     get_sheet_url,
+    load_general_methods,
 )
 from .protocol_loader import load_protocol
+from .skill_retrieval import SkillIndex, clean_whitespace
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +119,8 @@ class ProtocolSession:
         self._exp_spreadsheet_id = experiments_spreadsheet_id
         self._exp_tab_title: str = ""     # set in create() after tab creation
         self._exp_tab_sheet_id: int = 0   # gid for URL linking
+        self._plate_layout_written: bool = False  # track if FACS plate layout has been written
+        self._skill_index: SkillIndex = SkillIndex()  # keyword-based context retrieval
 
     @classmethod
     async def create(
@@ -151,11 +162,15 @@ class ProtocolSession:
         else:
             logger.warning("No experiments spreadsheet for '%s' — live logging disabled", folder_name)
 
+        is_facs = "bone marrow" in folder_name.lower() and "facs" in folder_name.lower()
+
+        # Build a lean base system prompt with just protocol text (always relevant).
+        # Companion + general methods go into the SkillIndex for per-message retrieval.
         system_prompt = build_system_prompt(
-            protocol_text=protocol_text,
-            companion_text=companion_text if companion_text.strip() else None,
+            protocol_text=clean_whitespace(protocol_text) if protocol_text else None,
             protocol_name=protocol_name,
             protocol_version=protocol_version,
+            is_facs=is_facs,
         )
 
         session = cls(
@@ -170,6 +185,16 @@ class ProtocolSession:
             experiments_spreadsheet_id=exp_sheet_id,
         )
 
+        # Build skill index from companion doc + cross-method knowledge
+        if companion_text and companion_text.strip():
+            n = session._skill_index.add_document(clean_whitespace(companion_text), source=folder_name)
+            logger.info("Indexed %d chunks from companion doc for '%s'", n, folder_name)
+
+        general_methods_text = await load_general_methods()
+        if general_methods_text and general_methods_text.strip():
+            n = session._skill_index.add_document(clean_whitespace(general_methods_text), source="General Methods")
+            logger.info("Indexed %d chunks from general_methods (%d total chunks)", n, session._skill_index.chunk_count)
+
         # Create a new tab for this experiment and write header
         await session._sheet_init()
 
@@ -183,30 +208,308 @@ class ProtocolSession:
             return
         self._exp_tab_title = f"{self.session_date} — {self.researcher_name}"
         try:
-            self._exp_tab_sheet_id = await create_experiment_tab(
+            self._exp_tab_sheet_id, self._exp_tab_title = await create_experiment_tab(
                 self._exp_spreadsheet_id, self._exp_tab_title
             )
-            # Write general info + section headers
-            await append_experiment_rows(
-                self._exp_spreadsheet_id,
-                self._exp_tab_title,
-                [
-                    # ── General Info ──
-                    ["GENERAL INFO"],
-                    ["Protocol", self.protocol_name],
-                    ["Version", self.protocol_version],
-                    ["Date", self.session_date],
-                    ["Time", self.session_time],
-                    ["Researcher", self.researcher_name],
-                    ["Objective", self.objective],
-                    [],
-                    # ── Column headers for log entries ──
-                    ["Time", "Section", "Content"],
-                ],
-            )
+            # Use method-specific template if available
+            if self._is_facs_method():
+                await self._sheet_init_facs()
+            else:
+                await self._sheet_init_default()
         except Exception as exc:
             logger.error("Failed to create experiment tab: %s", exc)
             self._exp_spreadsheet_id = None  # disable further writes
+
+    def _is_facs_method(self) -> bool:
+        """Check if this session is a Bone Marrow FACS experiment."""
+        name = (self.folder_name or self.protocol_name).lower()
+        return "bone marrow" in name and "facs" in name
+
+    async def _sheet_init_default(self) -> None:
+        """Write the default experiment sheet header."""
+        await append_experiment_rows(
+            self._exp_spreadsheet_id,
+            self._exp_tab_title,
+            [
+                ["GENERAL INFO"],
+                ["Protocol", self.protocol_name],
+                ["Version", self.protocol_version],
+                ["Date", self.session_date],
+                ["Time", self.session_time],
+                ["Researcher", self.researcher_name],
+                ["Objective", self.objective],
+                [],
+                ["Time", "Section", "Content"],
+            ],
+        )
+
+    async def _sheet_init_facs(self) -> None:
+        """Write the FACS experiment sheet with structured layout.
+
+        Creates a lean template with headers and reference data.
+        The calculator agent populates sample table, plate layout,
+        and master mix sections via [CALC_DATA] blocks.
+        """
+        rows = [
+            # ── General Info ──
+            ["GENERAL INFO"],
+            ["Protocol", self.protocol_name],
+            ["Version", self.protocol_version],
+            ["Date", self.session_date],
+            ["Time", self.session_time],
+            ["Researcher", self.researcher_name],
+            ["Objective", self.objective],
+            [],
+            # ── FACs Plate Layout (header only — bot fills via CALC_DATA) ──
+            ["FACs PLATE LAYOUT"],
+            ["(Will be populated by calculator agent based on treatment groups)"],
+            [],
+            # ── Sample Table (header only — bot fills via CALC_DATA) ──
+            ["SAMPLE TABLE"],
+            ["sample type", "Treatment", "Fraction", "IF condition",
+             "Expected cells", "Actual cells", "Volume (µL)", "Resuspension vol", "Comments"],
+            [],
+            # ── Antibody Reference ──
+            ["ANTIBODY PANEL"],
+            ["Abs", "Fluorophore", "vol/1×10⁶ cells (µL)", "Laser", "Detector"],
+            ["Biotin (Anti-lineage)", "Vio-Bright", "0.5", "488", "525-40"],
+            ["SCA1", "PerCP-Vio 770", "2", "488", "690-50"],
+            ["CD117", "PE", "2", "561", "585-42"],
+            ["CD16/CD32", "PE-Vio", "2", "561", "610-20"],
+            ["CD105", "PE-Vio770", "2", "561", "780-60"],
+            ["CD41", "APC-Vio770", "2", "638", "780-60"],
+            ["CD150", "BV605", "2", "405", "525-40"],
+            ["SNIPER", "AF647", "use on origin only", "638", "660-10"],
+            [],
+            ["IgG ISOTYPE CONTROLS"],
+            ["PE", "2 µL/1×10⁶"],
+            ["PerCP-Vio700", "2 µL/1×10⁶"],
+            ["PE-Vio770", "2 µL/1×10⁶"],
+            ["APC-Vio770", "2 µL/1×10⁶"],
+            [],
+            # ── Master Mix (header only — bot fills via CALC_DATA) ──
+            ["ANTIBODY MASTER MIX — ALL AB POOL"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            ["IgG CONTROL POOL"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            ["LIN(+) TUBES"],
+            ["(Calculator will compute based on actual cell counts)"],
+            [],
+            # ── Zombie Staining (header only — bot fills via CALC_DATA) ──
+            ["ZOMBIE STAINING"],
+            ["(Calculator will compute based on number of samples)"],
+            [],
+            # ── Calculator Results ──
+            ["CALCULATOR RESULTS"],
+            [],
+            # ── Session Log ──
+            ["SESSION LOG"],
+            ["Time", "Section", "Content"],
+        ]
+        await append_experiment_rows(
+            self._exp_spreadsheet_id, self._exp_tab_title, rows,
+        )
+
+    async def _write_plate_layout(self, treatments: list[str]) -> None:
+        """Write the FACS plate layout to the experiment sheet.
+
+        Generates a standard 96-well plate layout with:
+        - Row A: Single stain controls (from first treatment group's Lin(-))
+        - Row B: Origin/unselected BM (All Abs, IgG, unstained per treatment)
+        - Row C: Lin(-) cells (All Abs, IgG, unstained per treatment)
+        - Row D: Lin(+) cells (noted as FACS tubes, not wells)
+        """
+        if not self._exp_spreadsheet_id or self._plate_layout_written:
+            return
+
+        n = len(treatments)
+        # Build column headers: 3 wells per treatment (All Abs, IgG, Unstained)
+        header = ["", "FACs plate", ""]
+        col_num = 1
+        for _ in treatments:
+            header.extend([str(col_num), str(col_num + 1), str(col_num + 2)])
+            col_num += 3
+        # Pad to 12 columns
+        while len(header) < 15:
+            header.append("")
+
+        # Row A: single stains
+        row_a = ["1. single stains", "1", "A",
+                 "Untreated", "Zombie", "Biotin VB",
+                 "Sca1 PerCP", "CD117 PE", "CD16/32 PE-Vio",
+                 "CD105 PE-V770", "CD41 APC-V770", "CD150 BV605",
+                 "SNIPER AF647", "", ""]
+
+        # Row B: Origin per treatment
+        row_b = ["2. Origin (unselected BM)", "2", "B"]
+        for t in treatments:
+            row_b.extend([f"{t} All Abs+Z+Lin", f"{t} IgG+Z+Lin", f"{t} unstained"])
+        while len(row_b) < 15:
+            row_b.append("")
+
+        # Row C: Lin(-) per treatment
+        row_c = ["3. Lin(-) cells", "3", "C"]
+        for t in treatments:
+            row_c.extend([f"{t} All Abs+Z", f"{t} IgG+Z", f"{t} unstained"])
+        while len(row_c) < 15:
+            row_c.append("")
+
+        # Row D: Lin(+) — FACS tubes
+        row_d = ["4. Lin(+) cells", "", "D"]
+        for t in treatments:
+            row_d.extend([f"{t} All Abs+Z (TUBE)", f"{t} IgG+Z", f"{t} unstained"])
+        while len(row_d) < 15:
+            row_d.append("")
+
+        # Empty rows E-H
+        rows_empty = [["", "", r] for r in "EFGH"]
+
+        # Treatment labels row
+        label_row = ["", "", ""]
+        for t in treatments:
+            label_row.extend([t, "", ""])
+        while len(label_row) < 15:
+            label_row.append("")
+
+        # Sample table with per-treatment rows
+        sample_header = ["SAMPLE TABLE"]
+        sample_cols = ["Sample type", "Fraction", "Treatment", "IF conditions",
+                       "Expected cells", "Actual cells", "Volume", "Comments"]
+
+        sample_rows = [sample_header, sample_cols]
+        sample_rows.append(["Single stains", "Lin(-) from first group", treatments[0],
+                            "Specific Abs + unstained + IgG", "", "75K each",
+                            "*2µL each Ab, *0.5µL biotin", ""])
+        for t in treatments:
+            sample_rows.append(["Origin", "Unselected BM", t,
+                                "1.All Abs  2.IgG  3.Unstained", "",
+                                "1. 1×10⁶  2. 0.1×10⁶  3. 0.1×10⁶",
+                                "Only ~1% are cells of interest", ""])
+            sample_rows.append(["Lin(-)", "Selected BM", t,
+                                "1.All Abs  2.IgG  3.Unstained", "",
+                                "1. ALL remaining  2. 100K  3. 100K", "", ""])
+            sample_rows.append(["Lin(+)", "Selected BM", t,
+                                "1.All Abs  2.IgG  3.Unstained", "",
+                                "1. 5×10⁶ (TUBE)  2. 0.2×10⁶  3. 0.2×10⁶",
+                                "All Abs in FACS tubes", ""])
+
+        all_rows = (
+            [header, row_a, row_b, row_c, row_d]
+            + rows_empty
+            + [label_row, []]
+            + sample_rows
+        )
+
+        await append_experiment_rows(
+            self._exp_spreadsheet_id, self._exp_tab_title, all_rows,
+        )
+        self._plate_layout_written = True
+        await self._sheet_log("📋 Plate Layout", f"Generated for {n} groups: {', '.join(treatments)}")
+        logger.info("Wrote FACS plate layout for treatments: %s", treatments)
+
+    def _parse_treatments(self, text: str) -> list[str]:
+        """Extract treatment group names from user text."""
+        lower = text.lower()
+        treatments = []
+        # Common patterns: "PBS and 5mg/kg", "two samples - PBS and 5mg/kg"
+        # Look for explicit group names
+        patterns = [
+            r"(?:samples?|groups?|treatments?)\s*[-:—]\s*(.+)",
+            r"(?:have|are|using)\s+(?:\w+\s+)?(?:samples?|groups?)\s*[-:—]?\s*(.+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, lower)
+            if m:
+                groups_text = m.group(1)
+                # Split on "and", ",", "+"
+                parts = re.split(r"\s+and\s+|,\s*|\+\s*", groups_text)
+                treatments = [p.strip().rstrip(".") for p in parts if p.strip()]
+                break
+
+        if not treatments:
+            # Fallback: look for known treatment keywords
+            known = ["pbs", "vehicle", "control", "untreated"]
+            dose_pat = re.findall(r"\d+\s*(?:mg/?kg|µg|ug|nm|µm)", lower)
+            for k in known:
+                if k in lower:
+                    treatments.append(k.upper() if k == "pbs" else k.capitalize())
+            treatments.extend(dose_pat)
+
+        return treatments
+
+    async def _write_calc_table(self, calc_lines: list[str]) -> None:
+        """Write calculator results to the experiment sheet.
+
+        calc_lines: list of pipe-separated strings from [CALC_DATA] blocks.
+        Each line is split on '|' into columns.
+        """
+        if not self._exp_spreadsheet_id:
+            return
+        rows = []
+        for line in calc_lines:
+            cells = [c.strip() for c in line.split("|")]
+            if any(cells):
+                rows.append(cells)
+        if rows:
+            await self._sheet_log("🧮 Calculator", f"Added {len(rows)} rows")
+            await append_experiment_rows(
+                self._exp_spreadsheet_id, self._exp_tab_title, rows,
+            )
+
+    async def _write_calc_rows(self, rows: list[list[str]]) -> None:
+        """Write pre-formatted calculation rows to the experiment sheet."""
+        if not self._exp_spreadsheet_id or not rows:
+            return
+        try:
+            await self._sheet_log("🧮 Calculator", f"Added {len(rows)} rows")
+            await append_experiment_rows(
+                self._exp_spreadsheet_id, self._exp_tab_title, rows,
+            )
+        except Exception as exc:
+            logger.error("Failed to write calc rows to sheet: %s", exc)
+
+    @staticmethod
+    def _extract_calc_fallback(reply: str) -> list[str]:
+        """Extract calculation data from plain-text LLM reply as pipe-separated lines.
+
+        Looks for patterns like:
+          - "Label: value" lines (grouped into sections by headers)
+          - Bullet points with calculations
+        Returns pipe-separated lines suitable for _write_calc_table.
+        """
+        lines: list[str] = []
+        current_section = ""
+        for raw_line in reply.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            # Detect section headers (bold markdown or ALL CAPS)
+            header_match = re.match(r"^\*\*(.+?)\*\*:?$", stripped)
+            if header_match:
+                current_section = header_match.group(1).strip()
+                lines.append(current_section)
+                continue
+            if stripped.isupper() and len(stripped) > 3:
+                current_section = stripped
+                lines.append(current_section)
+                continue
+            # Detect "Label: value" or "- Label: value" patterns
+            kv_match = re.match(
+                r"^[-•*]?\s*(.+?):\s+(.+)$", stripped
+            )
+            if kv_match:
+                key = kv_match.group(1).strip().lstrip("*").rstrip("*")
+                val = kv_match.group(2).strip()
+                # Skip lines that are just narrative explanations
+                if len(val) > 100 or val.endswith("?"):
+                    continue
+                lines.append(f"{key} | {val}")
+
+        # Only return if we got meaningful structured data (at least 3 data lines)
+        data_lines = [l for l in lines if "|" in l]
+        return lines if len(data_lines) >= 3 else []
 
     async def _sheet_log(self, section: str, content: str) -> None:
         """Append a single structured row to the experiment tab."""
@@ -227,6 +530,19 @@ class ProtocolSession:
             return get_sheet_url(self._exp_spreadsheet_id, self._exp_tab_sheet_id)
         return ""
 
+    # ── FACS message helpers ────────────────────────────────────────────────
+
+    def _build_prompt(self, text: str) -> str:
+        """Build message-specific system prompt with relevant skill context."""
+        skill_context = self._skill_index.retrieve(text)
+        if not skill_context:
+            return self.system_prompt
+        return (
+            self.system_prompt
+            + "\n\n=== RELEVANT KNOWLEDGE (retrieved for this message) ===\n"
+            + skill_context
+        )
+
     # ── Message routing ───────────────────────────────────────────────────────
 
     async def handle_message(
@@ -237,18 +553,82 @@ class ProtocolSession:
     ) -> str:
         """Route a text or image+text message through the Protocol Expert.
 
-        Regular conversation is NOT logged to the experiment sheet — only
-        explicit notes, deviations, buffers, and dilutions are recorded.
+        Automatically detects [OBS: ...] tags in the AI response, logs them
+        to the event log and experiment sheet, and strips the tags from the
+        reply shown to the user.
+
+        For FACS sessions: parses cell data from LLM reply, runs deterministic
+        calculations in Python, writes results to sheet, and appends a formatted
+        summary to the reply.
         """
+        prompt = self._build_prompt(text)
+
         if image_bytes:
-            return await send_message_with_image(
+            reply = await send_message_with_image(
                 self.history,
                 image_bytes,
                 text,
-                system_prompt=self.system_prompt,
+                system_prompt=prompt,
                 notify_retry=notify_retry,
             )
-        return await send_message(self.history, text, system_prompt=self.system_prompt, notify_retry=notify_retry)
+        else:
+            reply = await send_message(self.history, text, system_prompt=prompt, notify_retry=notify_retry)
+
+        # Extract auto-detected observations
+        observations = re.findall(r"\[OBS:\s*(.+?)\]", reply)
+        for obs in observations:
+            self._event_log.append(f"[NOTE] {obs}")
+            await self._sheet_log("📝 Auto-Note", obs)
+
+        calc_summary = ""
+
+        if self._is_facs_method():
+            # Auto-generate plate layout from LLM reply if not written yet
+            if not self._plate_layout_written:
+                treatments = self._parse_treatments(text) or self._parse_treatments(reply)
+                if treatments:
+                    try:
+                        await self._write_plate_layout(treatments)
+                    except Exception as exc:
+                        logger.warning("Failed to write plate layout: %s", exc)
+
+            # Parse cell data and run code-based calculations
+            cell_data = parse_cell_data(reply)
+            if cell_data:
+                # Also write plate layout if we haven't yet (treatments from cell data)
+                if not self._plate_layout_written:
+                    treatments = list(dict.fromkeys(d.treatment for d in cell_data))
+                    if treatments:
+                        try:
+                            await self._write_plate_layout(treatments)
+                        except Exception as exc:
+                            logger.warning("Failed to write plate layout: %s", exc)
+
+                results = compute_facs(cell_data)
+                if results.samples:
+                    # Write to experiment sheet
+                    rows = format_sheet_rows(results)
+                    await self._write_calc_rows(rows)
+                    # Format summary for Telegram
+                    calc_summary = format_telegram_summary(results)
+                    logger.info("FACS calculator: %d samples, %d warnings",
+                                len(results.samples), len(results.warnings))
+
+        # Strip internal tags from the user-facing reply
+        clean_reply = re.sub(r"\s*\[OBS:\s*.+?\]\s*", "\n", reply).strip()
+        clean_reply = re.sub(
+            r"\s*\[CELL_DATA\]\s*\n.*?(?:\[/CELL_DATA\]|\Z)",
+            "\n", clean_reply, flags=re.DOTALL,
+        ).strip()
+        clean_reply = re.sub(
+            r"\s*\[CALC_DATA\]\s*\n.*?(?:\[/CALC_DATA\]|\Z)",
+            "\n", clean_reply, flags=re.DOTALL,
+        ).strip()
+
+        if calc_summary:
+            clean_reply = clean_reply + "\n\n" + calc_summary
+
+        return clean_reply
 
     async def handle_deviation(self, description: str) -> str:
         """Log a protocol deviation and get Claude's acknowledgement + impact assessment."""
