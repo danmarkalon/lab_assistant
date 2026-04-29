@@ -74,9 +74,8 @@ def _to_telegram_html(text: str) -> str:
 
     Handles: **bold**, *italic*, `code`, ```code blocks```, headers (### ),
     bullet points (- or *), and escapes HTML entities.
-    Falls back to plain text if conversion would break.
     """
-    # First escape HTML entities in the raw text
+    # Escape HTML entities first
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     # Code blocks (``` ... ```) → <pre>
@@ -85,17 +84,20 @@ def _to_telegram_html(text: str) -> str:
     # Inline code (`...`) → <code>
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
 
+    # Headers: ### text → bold (before bullet processing)
+    text = re.sub(r"^#{1,4}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # Bullet points: leading "- " or "* " → "• " (before italic to avoid conflicts)
+    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+
     # Bold: **text** → <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
-    # Italic: *text* → <i>text</i>  (but not bullet points at line start)
-    text = re.sub(r"(?<!\n)(?<!^)\*([^*\n]+?)\*", r"<i>\1</i>", text)
+    # Italic: *text* → <i>text</i>  (only mid-line, not leftover bullets)
+    text = re.sub(r"(?<=\s)\*([^*\n]+?)\*(?=\s|$|[.,;:!?)])", r"<i>\1</i>", text)
 
-    # Headers: ### text → bold with line break
-    text = re.sub(r"^#{1,4}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-
-    # Bullet points: leading "- " or "* " → "• "
-    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+    # Clean up any remaining stray * that would break display
+    # (don't touch * inside <pre>, <code>, <b>, <i> tags)
 
     return text
 
@@ -105,10 +107,16 @@ async def _send_reply(message, text: str) -> None:
     html = _to_telegram_html(text)
     try:
         await message.reply_text(html, parse_mode="HTML")
-    except Exception:
-        # If HTML parse fails, send as plain text (strip leftover tags)
+    except Exception as exc:
+        logger.warning("HTML send failed (%s), falling back to plain text", exc)
+        # Strip all HTML tags and send as plain text
         plain = re.sub(r"<[^>]+>", "", html)
-        await message.reply_text(plain)
+        # Restore escaped entities
+        plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        try:
+            await message.reply_text(plain)
+        except Exception as exc2:
+            logger.error("Plain text send also failed: %s", exc2)
 
 # ── Conversation state constants ──────────────────────────────────────────────
 

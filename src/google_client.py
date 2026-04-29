@@ -198,6 +198,10 @@ def _load_general_methods_sync() -> str:
         files = result2.get("files", [])
         if files:
             text = _read_doc_sync(files[0]["id"])
+            # Strip excessive whitespace (the local file has 93% padding)
+            import re as _re
+            text = _re.sub(r" {3,}", " ", text)
+            text = "\n".join(l.rstrip() for l in text.splitlines())
             _general_methods_cache = text
             logger.info("Loaded general_methods_assistant from Drive (%d chars)", len(text))
             return text
@@ -206,6 +210,10 @@ def _load_general_methods_sync() -> str:
     local_path = Path(__file__).parent.parent / "general_methods_assistant.md"
     if local_path.exists():
         text = local_path.read_text(encoding="utf-8")
+        # Strip excessive whitespace (the local file has 93% padding)
+        import re as _re
+        text = _re.sub(r" {3,}", " ", text)
+        text = "\n".join(l.rstrip() for l in text.splitlines())
         _general_methods_cache = text
         logger.info("Loaded general_methods_assistant from local file (%d chars)", len(text))
         return text
@@ -383,31 +391,44 @@ async def find_experiments_sheet_id(
 
 def _create_experiment_tab_sync(
     spreadsheet_id: str, tab_title: str
-) -> int:
-    """Create a new sheet tab at position 0 (leftmost). Returns the sheetId."""
+) -> tuple[int, str]:
+    """Create a new sheet tab at position 0 (leftmost). Returns (sheetId, actual_title).
+
+    If a tab with the same name already exists, appends (#2), (#3), etc.
+    """
     svc = _get_service("sheets", "v4")
-    resp = svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={
-            "requests": [
-                {
-                    "addSheet": {
-                        "properties": {
-                            "title": tab_title,
-                            "index": 0,
+    candidate = tab_title
+    for attempt in range(1, 10):
+        try:
+            resp = svc.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "addSheet": {
+                                "properties": {
+                                    "title": candidate,
+                                    "index": 0,
+                                }
+                            }
                         }
-                    }
-                }
-            ]
-        },
-    ).execute()
-    sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-    logger.info("Created experiment tab '%s' (sheetId=%d) at index 0", tab_title, sheet_id)
-    return sheet_id
+                    ]
+                },
+            ).execute()
+            sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+            logger.info("Created experiment tab '%s' (sheetId=%d) at index 0", candidate, sheet_id)
+            return sheet_id, candidate
+        except Exception as exc:
+            if "already exists" in str(exc).lower():
+                candidate = f"{tab_title} (#{attempt + 1})"
+                logger.warning("Tab '%s' exists, trying '%s'", tab_title if attempt == 1 else candidate, candidate)
+                continue
+            raise
+    raise RuntimeError(f"Could not create tab after 9 attempts: {tab_title}")
 
 
-async def create_experiment_tab(spreadsheet_id: str, tab_title: str) -> int:
-    """Create a new sheet tab at position 0 (newest first). Returns sheetId."""
+async def create_experiment_tab(spreadsheet_id: str, tab_title: str) -> tuple[int, str]:
+    """Create a new sheet tab at position 0 (newest first). Returns (sheetId, actual_title)."""
     return await _run(_create_experiment_tab_sync, spreadsheet_id, tab_title)
 
 

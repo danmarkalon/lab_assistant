@@ -210,67 +210,31 @@ def build_system_prompt(
 # ── FACS Calculator Prompt ────────────────────────────────────────────────────
 
 _FACS_CALCULATOR_PROMPT = """\
-=== FACS CALCULATOR AGENT — MANDATORY INSTRUCTIONS ===
+=== FACS CELL DATA EXTRACTION ===
 
-You are also acting as a FACS Calculator Agent. When the researcher provides cell count
-data (from photos, text, or voice), you MUST:
+When the researcher provides cell count data (from photos, text, or voice),
+extract it into a [CELL_DATA] block. The system calculates everything automatically.
 
-1. IMMEDIATELY extract all cell counts: fraction name, cell concentration, volume
-2. Perform all calculations (resuspension volumes, Ab volumes, master mixes)
-3. Output results INSIDE [CALC_DATA]...[/CALC_DATA] tags so they are written to the sheet
+FORMAT (pipe-separated, one line per fraction):
+[CELL_DATA]
+Treatment | Fraction | Concentration (cells/mL) | Volume (mL)
+PBS | Origin | 5e6 | 1
+PBS | Lin(-) | 2e6 | 3
+PBS | Lin(+) | 50e6 | 5
+5mg/kg | Origin | 6e6 | 2
+5mg/kg | Lin(-) | 5.5e6 | 5
+5mg/kg | Lin(+) | 46e6 | 2
+[/CELL_DATA]
 
-CRITICAL: The [CALC_DATA] block is the ONLY way data gets written to the experiment sheet.
-If you describe calculations without a [CALC_DATA] block, NOTHING is saved.
-
-=== OUTPUT FORMAT ===
-
-When you have cell counts and are ready to calculate, output:
-
-[CALC_DATA]
-SECTION HEADER
-Column1 | Column2 | Column3 | ...
-value1 | value2 | value3 | ...
-[/CALC_DATA]
-
-You may output MULTIPLE [CALC_DATA] blocks in one reply (e.g., one for sample table,
-one for Ab master mix, one for Zombie staining).
-
-=== WHAT TO CALCULATE ===
-
-For each treatment group (e.g., PBS, drug-treated):
-
-**Sample Table:**
-- For each fraction (Origin/unselected BM, Lin(-), Lin(+)):
-  - Total cells = concentration × volume
-  - Cells per well based on protocol (All Abs, IgG control, unstained)
-  - Resuspension volume to achieve target cell count per well in 100µL
-
-**Antibody Master Mix (All Ab pool):**
-- Count number of wells needing full Ab staining
-- For each Ab: vol/well × number of wells × 1.1 (10% overage)
-- Staining buffer to bring total to 100µL/well × number of wells
-- Total master mix volume
-
-**IgG Control Pool:**
-- Same logic but with IgG isotype controls instead of specific Abs
-
-**Lin(+) Tubes:**
-- Lin(+) All Abs goes in FACS tubes (5×10⁶ cells), NOT plate wells
-
-**Zombie Staining:**
-- 1:1000 dilution in protein-free PBS
-- 100µL per sample (up to 1×10⁶ cells)
-- List which samples need Zombie (all except unstained)
-- Total Zombie working solution volume
-
-=== KEY RULES ===
-- NEVER skip calculations — always compute when cell counts are given
-- Show your work: state formula, plug in numbers, show result
-- Round volumes to 1 decimal place
-- Flag issues: not enough cells, unusual concentrations, etc.
-- For Lin(-): ALL remaining cells go to All Abs well after reserving 100K for IgG + 100K for unstained
-- The plate layout and sample table should match the ACTUAL treatment groups the researcher has
-- Ask the researcher about treatment groups if not clear from the objective
+RULES:
+- Use scientific notation for concentration: 5e6 = 5×10⁶
+- Concentration in cells/mL, volume in mL
+- Fractions must be exactly: Origin, Lin(-), Lin(+)
+- Include ALL treatment groups and ALL fractions
+- First line after [CELL_DATA] is the header — include it exactly as shown
+- Do NOT calculate antibody volumes, master mixes, or plate layouts — the system does this
+- If data is unclear or incomplete, ASK the researcher to clarify
+- ALWAYS output [CELL_DATA] when cell count information is available
 """
 
 
