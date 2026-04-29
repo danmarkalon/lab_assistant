@@ -419,3 +419,34 @@ async def call_claude(
 
     cfg = _make_config(system_prompt, max_tokens)
     return await _generate_with_fallback(gemini_messages, cfg)
+
+
+async def describe_image(
+    image_bytes: bytes,
+    instruction: str = "",
+    media_type: str = "image/jpeg",
+    notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
+) -> str:
+    """Standalone vision call — extracts text/data from an image.
+
+    Uses a minimal prompt and no conversation history so the image
+    is processed once and never re-sent on subsequent turns.
+    Returns a text description that can be fed into the main agent.
+    """
+    image_data = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = instruction or (
+        "Extract ALL text, numbers, labels, and measurements visible in this image. "
+        "Preserve the structure (tables, lists, groupings). "
+        "If handwritten, transcribe carefully. Output only the extracted content."
+    )
+    contents = [
+        {
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": media_type, "data": image_data}},
+                {"text": prompt},
+            ],
+        }
+    ]
+    cfg = _make_config("You are a precise image-to-text extraction tool.", 1024)
+    return await _generate_with_fallback(contents, cfg, notify_retry)

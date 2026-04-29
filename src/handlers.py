@@ -37,7 +37,7 @@ from telegram.ext import (
     filters,
 )
 
-from .claude_client import BASE_SYSTEM_PROMPT, ConversationHistory, send_message, send_message_with_image
+from .claude_client import BASE_SYSTEM_PROMPT, ConversationHistory, describe_image, send_message, send_message_with_image
 from .config import get_researcher_name, is_allowed
 from .experiment_db import (
     PROJECT_SYSTEM_PROMPT,
@@ -793,13 +793,18 @@ async def active_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     buf = io.BytesIO()
     await photo_file.download_to_memory(buf)
 
-    caption = (
-        update.message.caption
-        or "Describe this lab image. Extract any text, labels, or measurements visible."
-    )
+    caption = update.message.caption or ""
     logger.info("[SESSION %s] %s (photo): %s", session.protocol_name, update.effective_user.first_name or "User", caption[:200])
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
-    reply = await session.handle_message(caption, image_bytes=buf.getvalue(), notify_retry=notify)
+
+    # Vision agent: extract image content in a standalone call (no history)
+    extraction = await describe_image(buf.getvalue(), notify_retry=notify)
+    # Feed extracted text to main agent as regular text (image never enters history)
+    combined = f"[Image content]\n{extraction}"
+    if caption:
+        combined = f"{caption}\n\n{combined}"
+    reply = await session.handle_message(combined, notify_retry=notify)
+
     logger.info("[SESSION %s] BOT: %s", session.protocol_name, reply[:500])
     await _send_reply(update.message, reply)
     return EXPERIMENT_ACTIVE
@@ -1053,13 +1058,16 @@ async def fallback_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     photo_file = await update.message.photo[-1].get_file()
     buf = io.BytesIO()
     await photo_file.download_to_memory(buf)
-    caption = (
-        update.message.caption
-        or "Describe this lab image. Extract any text, labels, or measurements visible."
-    )
+    caption = update.message.caption or ""
     history = _get_history(update.effective_user.id)
     notify = lambda: update.message.reply_text("⏳ High traffic, hold on...")
-    reply = await send_message_with_image(history, buf.getvalue(), caption, notify_retry=notify)
+
+    # Vision agent: standalone image extraction (no history pollution)
+    extraction = await describe_image(buf.getvalue(), notify_retry=notify)
+    combined = f"[Image content]\n{extraction}"
+    if caption:
+        combined = f"{caption}\n\n{combined}"
+    reply = await send_message(history, combined, notify_retry=notify)
     await _send_reply(update.message, reply)
 
 

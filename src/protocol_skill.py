@@ -28,7 +28,6 @@ from .claude_client import (
     build_system_prompt,
     call_claude,
     send_message,
-    send_message_with_image,
 )
 from .config import SHEET_LAB_JOURNAL
 from .facs_calculator import (
@@ -548,10 +547,12 @@ class ProtocolSession:
     async def handle_message(
         self,
         text: str,
-        image_bytes: Optional[bytes] = None,
         notify_retry: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> str:
-        """Route a text or image+text message through the Protocol Expert.
+        """Route a text message through the Protocol Expert.
+
+        Images are pre-processed by the vision agent in handlers.py and arrive
+        here as text descriptions — no image bytes ever enter session history.
 
         Automatically detects [OBS: ...] tags in the AI response, logs them
         to the event log and experiment sheet, and strips the tags from the
@@ -563,16 +564,7 @@ class ProtocolSession:
         """
         prompt = self._build_prompt(text)
 
-        if image_bytes:
-            reply = await send_message_with_image(
-                self.history,
-                image_bytes,
-                text,
-                system_prompt=prompt,
-                notify_retry=notify_retry,
-            )
-        else:
-            reply = await send_message(self.history, text, system_prompt=prompt, notify_retry=notify_retry)
+        reply = await send_message(self.history, text, system_prompt=prompt, notify_retry=notify_retry)
 
         # Extract auto-detected observations
         observations = re.findall(r"\[OBS:\s*(.+?)\]", reply)
