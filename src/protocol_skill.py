@@ -131,6 +131,7 @@ class ProtocolSession:
         self._exp_tab_title: str = ""     # set in create() after tab creation
         self._exp_tab_sheet_id: int = 0   # gid for URL linking
         self._plate_layout_written: bool = False  # track if FACS plate layout has been written
+        self._known_treatments: list[str] = []  # accumulated treatment groups
         self._skill_index: SkillIndex = SkillIndex()  # keyword-based context retrieval
 
     @classmethod
@@ -564,7 +565,7 @@ class ProtocolSession:
         logger.info("Wrote FACS plate layout for treatments: %s", treatments)
 
     def _parse_treatments(self, text: str) -> list[str]:
-        """Extract treatment group names from user text."""
+        """Extract treatment group names from user text or objective."""
         lower = text.lower()
         treatments = []
         # Common patterns: "PBS and 5mg/kg", "two samples - PBS and 5mg/kg"
@@ -572,6 +573,8 @@ class ProtocolSession:
         patterns = [
             r"(?:samples?|groups?|treatments?)\s*[-:—]\s*(.+)",
             r"(?:have|are|using)\s+(?:\w+\s+)?(?:samples?|groups?)\s*[-:—]?\s*(.+)",
+            # "PBS and 5mg/kg" standalone
+            r"\b(pbs\s+and\s+\d+\s*mg/?kg)\b",
         ]
         for pat in patterns:
             m = re.search(pat, lower)
@@ -583,7 +586,7 @@ class ProtocolSession:
                 break
 
         if not treatments:
-            # Fallback: look for known treatment keywords
+            # Fallback: look for known treatment keywords + dose patterns
             known = ["pbs", "vehicle", "control", "untreated"]
             dose_pat = re.findall(r"\d+\s*(?:mg/?kg|µg|ug|nm|µm)", lower)
             for k in known:
@@ -591,7 +594,15 @@ class ProtocolSession:
                     treatments.append(k.upper() if k == "pbs" else k.capitalize())
             treatments.extend(dose_pat)
 
-        return treatments
+        # Normalize: capitalize PBS, strip whitespace
+        normalized = []
+        for t in treatments:
+            t = t.strip()
+            if t.lower() == "pbs":
+                t = "PBS"
+            normalized.append(t)
+
+        return normalized
 
     async def _write_calc_table(self, calc_lines: list[str]) -> None:
         """Write calculator results to the experiment sheet.
@@ -823,8 +834,7 @@ class ProtocolSession:
         calc_summary = ""
 
         if self._is_facs_method():
-            # Auto-generate plate layout from LLM reply
-            # Re-write if user reports missing treatments or requests update
+            # Auto-generate plate layout from text, reply, or objective
             need_plate = not self._plate_layout_written
             if self._plate_layout_written:
                 low = text.lower()
@@ -833,22 +843,35 @@ class ProtocolSession:
                     need_plate = True
 
             if need_plate:
-                treatments = self._parse_treatments(text) or self._parse_treatments(reply)
-                if treatments:
+                # Gather treatments from all sources and merge with known
+                new_treatments = (
+                    self._parse_treatments(text)
+                    or self._parse_treatments(reply)
+                    or self._parse_treatments(self.objective)
+                )
+                if new_treatments:
+                    merged = list(dict.fromkeys(
+                        self._known_treatments + new_treatments
+                    ))
                     try:
-                        await self._write_plate_layout(treatments)
+                        await self._write_plate_layout(merged)
+                        self._known_treatments = merged
                     except Exception as exc:
                         logger.warning("Failed to write plate layout: %s", exc)
 
             # Parse cell data and run code-based calculations
             cell_data = parse_cell_data(reply)
             if cell_data:
-                # Also write plate layout if we haven't yet (treatments from cell data)
-                if not self._plate_layout_written:
-                    treatments = list(dict.fromkeys(d.treatment for d in cell_data))
-                    if treatments:
+                # Update plate layout from cell data treatments if needed
+                data_treatments = list(dict.fromkeys(d.treatment for d in cell_data))
+                if data_treatments:
+                    merged = list(dict.fromkeys(
+                        self._known_treatments + data_treatments
+                    ))
+                    if merged != self._known_treatments or not self._plate_layout_written:
                         try:
-                            await self._write_plate_layout(treatments)
+                            await self._write_plate_layout(merged)
+                            self._known_treatments = merged
                         except Exception as exc:
                             logger.warning("Failed to write plate layout: %s", exc)
 
