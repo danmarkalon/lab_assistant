@@ -335,7 +335,7 @@ def compute_facs(data: list[FractionData]) -> CalculationResults:
 def format_sheet_rows(results: CalculationResults) -> list[list[str]]:
     rows: list[list[str]] = []
 
-    rows.append(["CELL COUNT SUMMARY"])
+    rows.append(["Cell count summary"])
     rows.append(["Treatment", "Fraction", "Concentration", "Volume (mL)",
                  "Total cells", "All Abs", "IgG", "Unstained"])
     for s in results.samples:
@@ -349,12 +349,12 @@ def format_sheet_rows(results: CalculationResults) -> list[list[str]]:
     rows.append([])
 
     if results.single_stain_total:
-        rows.append(["SINGLE STAINS",
+        rows.append(["Single stains",
                      f"75K × {N_SINGLE_STAINS} = {_fmt(results.single_stain_total)}",
                      f"From {results.treatments[0]} Lin(-)"])
         rows.append([])
 
-    rows.append(["ANTIBODY MASTER MIX (All Ab Pool)"])
+    rows.append(["Antibody master mix (All Ab pool)"])
     rows.append(["Antibody", "Fluorophore", "µL/1×10⁶", "Total cells", "Volume (µL)"])
     for ab in results.ab_mix:
         note = " (Origin only)" if ab.get("origin_only") else ""
@@ -362,26 +362,26 @@ def format_sheet_rows(results: CalculationResults) -> list[list[str]]:
                      str(ab["vol_per_1M"]), _fmt(ab["total_cells"]),
                      str(ab["total_vol"])])
     rows.append(["Staining buffer", "", "", "", str(results.ab_mix_buffer)])
-    rows.append(["TOTAL", "", "", "", str(results.ab_mix_total)])
+    rows.append(["Total", "", "", "", str(results.ab_mix_total)])
     rows.append([])
 
-    rows.append(["IgG CONTROL POOL"])
+    rows.append(["IgG control pool"])
     rows.append(["Isotype", "µL/1×10⁶", "Total cells", "Volume (µL)"])
     for ig in results.igg_mix:
         rows.append([ig["name"], str(ig["vol_per_1M"]),
                      _fmt(ig["total_cells"]), str(ig["total_vol"])])
     rows.append(["Staining buffer", "", "", str(results.igg_mix_buffer)])
-    rows.append(["TOTAL", "", "", str(results.igg_mix_total)])
+    rows.append(["Total", "", "", str(results.igg_mix_total)])
     rows.append([])
 
-    rows.append(["ZOMBIE STAINING"])
+    rows.append(["Zombie staining"])
     rows.append([f"Samples: {results.zombie_samples}",
                  f"Working solution: {results.zombie_working_vol} µL",
                  f"Stock: {results.zombie_stock_vol} µL (1:{ZOMBIE_DILUTION})"])
     rows.append([])
 
     if results.warnings:
-        rows.append(["⚠️ WARNINGS"])
+        rows.append(["Warnings"])
         for w in results.warnings:
             rows.append([w])
         rows.append([])

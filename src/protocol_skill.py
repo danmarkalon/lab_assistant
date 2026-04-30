@@ -35,15 +35,27 @@ from .facs_calculator import (
     format_sheet_rows,
     format_telegram_summary,
     parse_cell_data,
+    _fmt as _facs_fmt,
 )
 from .google_client import (
     append_doc_text,
     append_experiment_rows,
     append_sheet_row,
+    batch_format,
+    clear_range,
     create_experiment_tab,
     find_experiments_sheet_id,
     get_sheet_url,
     load_general_methods,
+    set_column_widths,
+    write_range,
+    COLORS,
+    TREATMENT_COLORS,
+    _cell_format,
+    _repeat_cell_request,
+    _update_borders_request,
+    _merge_cells_request,
+    _rgb,
 )
 from .protocol_loader import load_protocol
 from .skill_retrieval import SkillIndex, clean_whitespace
@@ -230,7 +242,7 @@ class ProtocolSession:
             self._exp_spreadsheet_id,
             self._exp_tab_title,
             [
-                ["GENERAL INFO"],
+                ["General info"],
                 ["Protocol", self.protocol_name],
                 ["Version", self.protocol_version],
                 ["Date", self.session_date],
@@ -241,17 +253,57 @@ class ProtocolSession:
                 ["Time", "Section", "Content"],
             ],
         )
+        # Format header row
+        sid = self._exp_tab_sheet_id
+        fmt = [
+            _repeat_cell_request(sid, 0, 1, 0, 3,
+                                 _cell_format(bold=True, underline=True, bg_hex=COLORS["header_bg"])),
+            _update_borders_request(sid, 0, 7, 0, 2),
+            _repeat_cell_request(sid, 8, 9, 0, 3,
+                                 _cell_format(bold=True, bg_hex=COLORS["header_bg"])),
+        ]
+        try:
+            await batch_format(self._exp_spreadsheet_id, fmt)
+        except Exception:
+            pass
 
     async def _sheet_init_facs(self) -> None:
         """Write the FACS experiment sheet with structured layout.
 
-        Creates a lean template with headers and reference data.
-        The calculator agent populates sample table, plate layout,
-        and master mix sections via [CALC_DATA] blocks.
+        Fixed row layout (0-indexed for API, 1-indexed in comments):
+        Row 0-6:   General info
+        Row 7:     empty
+        Row 8:     Plate layout header
+        Row 9-17:  Plate layout (8 rows A-H + treatment labels)
+        Row 18:    empty
+        Row 19:    Sample table header
+        Row 20:    Sample table column headers
+        Row 21-38: Sample table data (up to 18 rows)
+        Row 39:    empty
+        Row 40:    Antibody panel header
+        Row 41:    Ab panel column headers
+        Row 42-50: Ab panel data
+        Row 51:    empty
+        Row 52:    IgG isotype header
+        Row 53-57: IgG data
+        Row 58:    empty
+        Row 59:    Calculator results header (populated after cell counts)
+        Row 60+:   Calculator fills in
         """
+        # ── Row mapping for later updates ──
+        self._row_plate_header = 8
+        self._row_plate_start = 9
+        self._row_sample_header = 19
+        self._row_sample_cols = 20
+        self._row_sample_data = 21
+        self._row_ab_panel = 40
+        self._row_igg_panel = 52
+        self._row_calc_header = 59
+        self._row_calc_start = 60
+
         rows = [
-            # ── General Info ──
-            ["GENERAL INFO"],
+            # Row 0-6: General info
+            ["General info"],
             ["Protocol", self.protocol_name],
             ["Version", self.protocol_version],
             ["Date", self.session_date],
@@ -259,18 +311,27 @@ class ProtocolSession:
             ["Researcher", self.researcher_name],
             ["Objective", self.objective],
             [],
-            # ── FACs Plate Layout (header only — bot fills via CALC_DATA) ──
-            ["FACs PLATE LAYOUT"],
-            ["(Will be populated by calculator agent based on treatment groups)"],
+            # Row 8: Plate layout header
+            ["Plate layout"],
+            # Row 9: placeholder — will be filled by _write_plate_layout
+            ["(awaiting treatment groups)"],
+            [], [], [], [], [], [], [],
             [],
-            # ── Sample Table (header only — bot fills via CALC_DATA) ──
-            ["SAMPLE TABLE"],
-            ["sample type", "Treatment", "Fraction", "IF condition",
+            # Row 19-20: Sample table
+            ["Sample table"],
+            ["Sample type", "Treatment", "Fraction", "Staining condition",
              "Expected cells", "Actual cells", "Volume (µL)", "Resuspension vol", "Comments"],
-            [],
-            # ── Antibody Reference ──
-            ["ANTIBODY PANEL"],
-            ["Abs", "Fluorophore", "vol/1×10⁶ cells (µL)", "Laser", "Detector"],
+            # Rows 21-38: sample data placeholder
+        ]
+        # Pad sample rows
+        for _ in range(18):
+            rows.append([])
+        rows.append([])  # Row 39: empty
+
+        # Row 40-50: Antibody panel
+        rows.extend([
+            ["Antibody panel"],
+            ["Antibody", "Fluorophore", "µL / 1×10⁶ cells", "Laser", "Detector"],
             ["Biotin (Anti-lineage)", "Vio-Bright", "0.5", "488", "525-40"],
             ["SCA1", "PerCP-Vio 770", "2", "488", "690-50"],
             ["CD117", "PE", "2", "561", "585-42"],
@@ -278,134 +339,228 @@ class ProtocolSession:
             ["CD105", "PE-Vio770", "2", "561", "780-60"],
             ["CD41", "APC-Vio770", "2", "638", "780-60"],
             ["CD150", "BV605", "2", "405", "525-40"],
-            ["SNIPER", "AF647", "use on origin only", "638", "660-10"],
+            ["SNIPER", "AF647", "use on Origin only", "638", "660-10"],
             [],
-            ["IgG ISOTYPE CONTROLS"],
-            ["PE", "2 µL/1×10⁶"],
-            ["PerCP-Vio700", "2 µL/1×10⁶"],
-            ["PE-Vio770", "2 µL/1×10⁶"],
-            ["APC-Vio770", "2 µL/1×10⁶"],
+        ])
+        # Row 52-57: IgG isotype panel
+        rows.extend([
+            ["IgG isotype controls"],
+            ["Isotype", "Volume per 1×10⁶ cells"],
+            ["PE", "2 µL"],
+            ["PerCP-Vio700", "2 µL"],
+            ["PE-Vio770", "2 µL"],
+            ["APC-Vio770", "2 µL"],
             [],
-            # ── Master Mix (header only — bot fills via CALC_DATA) ──
-            ["ANTIBODY MASTER MIX — ALL AB POOL"],
-            ["(Calculator will compute based on actual cell counts)"],
-            [],
-            ["IgG CONTROL POOL"],
-            ["(Calculator will compute based on actual cell counts)"],
-            [],
-            ["LIN(+) TUBES"],
-            ["(Calculator will compute based on actual cell counts)"],
-            [],
-            # ── Zombie Staining (header only — bot fills via CALC_DATA) ──
-            ["ZOMBIE STAINING"],
-            ["(Calculator will compute based on number of samples)"],
-            [],
-            # ── Calculator Results ──
-            ["CALCULATOR RESULTS"],
-            [],
-            # ── Session Log ──
-            ["SESSION LOG"],
-            ["Time", "Section", "Content"],
-        ]
+        ])
+        # Row 59: Calculator results placeholder
+        rows.extend([
+            ["Calculator results"],
+            ["(will be populated after cell count data is provided)"],
+        ])
+
         await append_experiment_rows(
             self._exp_spreadsheet_id, self._exp_tab_title, rows,
         )
 
-    async def _write_plate_layout(self, treatments: list[str]) -> None:
-        """Write the FACS plate layout to the experiment sheet.
+        # ── Apply formatting ──
+        sid = self._exp_tab_sheet_id
+        fmt_requests: list[dict] = []
 
-        Generates a standard 96-well plate layout with:
-        - Row A: Single stain controls (from first treatment group's Lin(-))
-        - Row B: Origin/unselected BM (All Abs, IgG, unstained per treatment)
-        - Row C: Lin(-) cells (All Abs, IgG, unstained per treatment)
-        - Row D: Lin(+) cells (noted as FACS tubes, not wells)
+        # Section headers: bold + underline, gray background
+        header_rows = [0, 8, 19, 40, 52, 59]
+        for r in header_rows:
+            fmt_requests.append(_repeat_cell_request(
+                sid, r, r + 1, 0, 10,
+                _cell_format(bold=True, underline=True, bg_hex=COLORS["header_bg"], font_size=11),
+            ))
+
+        # Column header rows: bold, light gray bg
+        col_header_rows = [20, 41, 53]
+        for r in col_header_rows:
+            fmt_requests.append(_repeat_cell_request(
+                sid, r, r + 1, 0, 10,
+                _cell_format(bold=True, bg_hex=COLORS["header_bg"]),
+            ))
+
+        # Table borders: Ab panel (rows 41-50), IgG panel (rows 53-57), sample table header
+        fmt_requests.append(_update_borders_request(sid, 41, 51, 0, 5))
+        fmt_requests.append(_update_borders_request(sid, 53, 57, 0, 2))
+        fmt_requests.append(_update_borders_request(sid, 20, 21, 0, 9))
+
+        # General info borders
+        fmt_requests.append(_update_borders_request(sid, 0, 7, 0, 2))
+
+        # Column widths
+        try:
+            await set_column_widths(self._exp_spreadsheet_id, sid, [
+                (0, 1, 160),   # A: labels
+                (1, 2, 130),   # B
+                (2, 3, 120),   # C
+                (3, 4, 140),   # D
+                (4, 5, 120),   # E
+                (5, 6, 100),   # F
+                (6, 7, 100),   # G
+                (7, 8, 120),   # H
+                (8, 9, 100),   # I
+            ])
+        except Exception:
+            pass  # non-critical
+
+        try:
+            await batch_format(self._exp_spreadsheet_id, fmt_requests)
+        except Exception as exc:
+            logger.warning("Sheet formatting failed (non-critical): %s", exc)
+
+    async def _write_plate_layout(self, treatments: list[str]) -> None:
+        """Write the FACS plate layout to the experiment sheet with color coding.
+
+        Layout (rows 9-17 in the sheet):
+        - Row 9:  Column numbers (1-12)
+        - Row 10: Row A — Single stain controls (light blue)
+        - Row 11: Row B — Origin samples (color per treatment)
+        - Row 12: Row C — Lin(-) samples (color per treatment)
+        - Row 13: Row D — Lin(+) samples (color per treatment, noted as FACS tubes)
+        - Row 14-17: Rows E-H (empty)
+
+        Colors: single stains = light blue, each treatment = distinct pastel color.
+        Fractions: Origin = bold, Lin(-) = italic, Lin(+) = underline.
         """
-        if not self._exp_spreadsheet_id or self._plate_layout_written:
+        if not self._exp_spreadsheet_id:
             return
 
         n = len(treatments)
-        # Build column headers: 3 wells per treatment (All Abs, IgG, Unstained)
-        header = ["", "FACs plate", ""]
-        col_num = 1
-        for _ in treatments:
-            header.extend([str(col_num), str(col_num + 1), str(col_num + 2)])
-            col_num += 3
-        # Pad to 12 columns
-        while len(header) < 15:
-            header.append("")
+        plate_start = getattr(self, "_row_plate_start", 9)
 
-        # Row A: single stains
-        row_a = ["1. single stains", "1", "A",
-                 "Untreated", "Zombie", "Biotin VB",
-                 "Sca1 PerCP", "CD117 PE", "CD16/32 PE-Vio",
-                 "CD105 PE-V770", "CD41 APC-V770", "CD150 BV605",
-                 "SNIPER AF647", "", ""]
+        # Build plate layout data
+        # Column headers
+        col_headers = ["", ""]
+        for i in range(1, 13):
+            col_headers.append(str(i))
+
+        # Row A: Single stain controls
+        single_stains = [
+            "Untreated", "Zombie", "Biotin VB", "Sca1 PerCP",
+            "CD117 PE", "CD16/32 PE-Vio", "CD105 PE-V770",
+            "CD41 APC-V770", "CD150 BV605", "SNIPER AF647",
+        ]
+        row_a = ["Single stains", "A"] + single_stains
+        while len(row_a) < 14:
+            row_a.append("")
 
         # Row B: Origin per treatment
-        row_b = ["2. Origin (unselected BM)", "2", "B"]
+        row_b = ["Origin", "B"]
         for t in treatments:
-            row_b.extend([f"{t} All Abs+Z+Lin", f"{t} IgG+Z+Lin", f"{t} unstained"])
-        while len(row_b) < 15:
+            row_b.extend([f"{t}\nAll Abs+Z+Lin", f"{t}\nIgG+Z+Lin", f"{t}\nUnstained"])
+        while len(row_b) < 14:
             row_b.append("")
 
         # Row C: Lin(-) per treatment
-        row_c = ["3. Lin(-) cells", "3", "C"]
+        row_c = ["Lin(−)", "C"]
         for t in treatments:
-            row_c.extend([f"{t} All Abs+Z", f"{t} IgG+Z", f"{t} unstained"])
-        while len(row_c) < 15:
+            row_c.extend([f"{t}\nAll Abs+Z", f"{t}\nIgG+Z", f"{t}\nUnstained"])
+        while len(row_c) < 14:
             row_c.append("")
 
-        # Row D: Lin(+) — FACS tubes
-        row_d = ["4. Lin(+) cells", "", "D"]
+        # Row D: Lin(+) per treatment — FACS tubes
+        row_d = ["Lin(+)", "D"]
         for t in treatments:
-            row_d.extend([f"{t} All Abs+Z (TUBE)", f"{t} IgG+Z", f"{t} unstained"])
-        while len(row_d) < 15:
+            row_d.extend([f"{t}\nAll Abs+Z\n(TUBE)", f"{t}\nIgG+Z", f"{t}\nUnstained"])
+        while len(row_d) < 14:
             row_d.append("")
 
-        # Empty rows E-H
-        rows_empty = [["", "", r] for r in "EFGH"]
+        # Rows E-H: empty
+        rows_eh = [["", chr(ord("E") + i)] + [""] * 12 for i in range(4)]
 
-        # Treatment labels row
-        label_row = ["", "", ""]
+        # Treatment label row
+        label_row = ["Treatment", ""]
         for t in treatments:
             label_row.extend([t, "", ""])
-        while len(label_row) < 15:
+        while len(label_row) < 14:
             label_row.append("")
 
-        # Sample table with per-treatment rows
-        sample_header = ["SAMPLE TABLE"]
-        sample_cols = ["Sample type", "Fraction", "Treatment", "IF conditions",
-                       "Expected cells", "Actual cells", "Volume", "Comments"]
+        all_rows = [col_headers, row_a, row_b, row_c, row_d] + rows_eh + [label_row]
 
-        sample_rows = [sample_header, sample_cols]
-        sample_rows.append(["Single stains", "Lin(-) from first group", treatments[0],
-                            "Specific Abs + unstained + IgG", "", "75K each",
-                            "*2µL each Ab, *0.5µL biotin", ""])
-        for t in treatments:
-            sample_rows.append(["Origin", "Unselected BM", t,
-                                "1.All Abs  2.IgG  3.Unstained", "",
-                                "1. 1×10⁶  2. 0.1×10⁶  3. 0.1×10⁶",
-                                "Only ~1% are cells of interest", ""])
-            sample_rows.append(["Lin(-)", "Selected BM", t,
-                                "1.All Abs  2.IgG  3.Unstained", "",
-                                "1. ALL remaining  2. 100K  3. 100K", "", ""])
-            sample_rows.append(["Lin(+)", "Selected BM", t,
-                                "1.All Abs  2.IgG  3.Unstained", "",
-                                "1. 5×10⁶ (TUBE)  2. 0.2×10⁶  3. 0.2×10⁶",
-                                "All Abs in FACS tubes", ""])
-
-        all_rows = (
-            [header, row_a, row_b, row_c, row_d]
-            + rows_empty
-            + [label_row, []]
-            + sample_rows
+        # Write data to the plate layout range
+        end_row_idx = plate_start + len(all_rows)
+        col_letter = chr(ord("A") + len(col_headers) - 1)
+        await write_range(
+            self._exp_spreadsheet_id,
+            self._exp_tab_title,
+            f"A{plate_start + 1}:{col_letter}{end_row_idx}",
+            all_rows,
         )
 
-        await append_experiment_rows(
-            self._exp_spreadsheet_id, self._exp_tab_title, all_rows,
-        )
+        # ── Apply formatting ──
+        sid = self._exp_tab_sheet_id
+        fmt: list[dict] = []
+
+        # Column header row (row numbers)
+        fmt.append(_repeat_cell_request(
+            sid, plate_start, plate_start + 1, 0, 14,
+            _cell_format(bold=True),
+        ))
+
+        # Row labels column (A): bold
+        fmt.append(_repeat_cell_request(
+            sid, plate_start, end_row_idx, 0, 1,
+            _cell_format(bold=True),
+        ))
+
+        # Single stains row (A): light blue background
+        fmt.append(_repeat_cell_request(
+            sid, plate_start + 1, plate_start + 2, 2, 12,
+            _cell_format(bg_hex=COLORS["single_stain"]),
+        ))
+
+        # Origin row: bold text for fraction identification
+        fmt.append(_repeat_cell_request(
+            sid, plate_start + 2, plate_start + 3, 0, 1,
+            _cell_format(bold=True),
+        ))
+
+        # Lin(-) row: italic text for fraction identification
+        fmt.append(_repeat_cell_request(
+            sid, plate_start + 3, plate_start + 4, 0, 1,
+            _cell_format(italic=True),
+        ))
+
+        # Lin(+) row: underline text for fraction identification
+        fmt.append(_repeat_cell_request(
+            sid, plate_start + 4, plate_start + 5, 0, 1,
+            _cell_format(underline=True),
+        ))
+
+        # Color each treatment's columns
+        for ti, _t in enumerate(treatments):
+            color = TREATMENT_COLORS[ti % len(TREATMENT_COLORS)]
+            col_start = 2 + ti * 3
+            col_end = col_start + 3
+            # Apply to rows B, C, D (origin, lin-, lin+)
+            for row_offset in range(2, 5):  # rows B=+2, C=+3, D=+4
+                fmt.append(_repeat_cell_request(
+                    sid, plate_start + row_offset, plate_start + row_offset + 1,
+                    col_start, min(col_end, 14),
+                    _cell_format(bg_hex=color),
+                ))
+
+        # Borders around the entire plate layout
+        fmt.append(_update_borders_request(
+            sid, plate_start, plate_start + 9, 0, 14,
+        ))
+
+        # Treatment label row: bold
+        label_row_idx = plate_start + 9
+        fmt.append(_repeat_cell_request(
+            sid, label_row_idx, label_row_idx + 1, 0, 14,
+            _cell_format(bold=True),
+        ))
+
+        try:
+            await batch_format(self._exp_spreadsheet_id, fmt)
+        except Exception as exc:
+            logger.warning("Plate layout formatting failed: %s", exc)
+
         self._plate_layout_written = True
-        await self._sheet_log("📋 Plate Layout", f"Generated for {n} groups: {', '.join(treatments)}")
         logger.info("Wrote FACS plate layout for treatments: %s", treatments)
 
     def _parse_treatments(self, text: str) -> list[str]:
@@ -458,16 +613,109 @@ class ProtocolSession:
             )
 
     async def _write_calc_rows(self, rows: list[list[str]]) -> None:
-        """Write pre-formatted calculation rows to the experiment sheet."""
+        """Write calculator results to the fixed calculator section of the sheet."""
         if not self._exp_spreadsheet_id or not rows:
             return
         try:
-            await self._sheet_log("🧮 Calculator", f"Added {len(rows)} rows")
-            await append_experiment_rows(
-                self._exp_spreadsheet_id, self._exp_tab_title, rows,
+            calc_start = getattr(self, "_row_calc_start", 60)
+            end_row = calc_start + len(rows)
+            # Determine max columns
+            max_cols = max(len(r) for r in rows) if rows else 8
+            col_letter = chr(ord("A") + max_cols - 1)
+            await write_range(
+                self._exp_spreadsheet_id,
+                self._exp_tab_title,
+                f"A{calc_start + 1}:{col_letter}{end_row}",
+                rows,
             )
+
+            # Format section headers and table borders
+            sid = self._exp_tab_sheet_id
+            fmt: list[dict] = []
+
+            # Find header rows in the data and apply formatting
+            for i, row in enumerate(rows):
+                if row and len(row) == 1 and row[0]:
+                    # Section header: bold + underline
+                    fmt.append(_repeat_cell_request(
+                        sid, calc_start + i, calc_start + i + 1, 0, max_cols,
+                        _cell_format(bold=True, underline=True, bg_hex=COLORS["header_bg"]),
+                    ))
+
+            # Borders around the entire calc section
+            if len(rows) > 1:
+                fmt.append(_update_borders_request(
+                    sid, calc_start, end_row, 0, max_cols,
+                ))
+
+            if fmt:
+                await batch_format(self._exp_spreadsheet_id, fmt)
+
+            logger.info("Wrote %d calc rows to sheet (rows %d-%d)", len(rows), calc_start, end_row)
         except Exception as exc:
             logger.error("Failed to write calc rows to sheet: %s", exc)
+
+    async def _write_sample_table(self, results) -> None:
+        """Write sample data to the fixed sample table section (rows 21+)."""
+        if not self._exp_spreadsheet_id:
+            return
+        sample_start = getattr(self, "_row_sample_data", 21)
+
+        rows: list[list[str]] = []
+        # Single stains row
+        if results.treatments:
+            rows.append([
+                "Single stains", results.treatments[0], "Lin(−)",
+                "10 individual Abs + unstained",
+                f"{_facs_fmt(results.single_stain_total)}",
+                "", "75K each", "", "",
+            ])
+
+        for s in results.samples:
+            tube = " (TUBE)" if s.get("tube") else ""
+            rows.append([
+                s["fraction"], s["treatment"], s["fraction"],
+                f"All Abs / IgG / Unstained",
+                f"{_facs_fmt(s['needed'])}",
+                f"{_facs_fmt(s['total_cells'])}",
+                f"{_facs_fmt(s['all_abs'])}{tube} / {_facs_fmt(s['igg'])} / {_facs_fmt(s['unstained'])}",
+                "", "",
+            ])
+
+        if not rows:
+            return
+
+        end_row = sample_start + len(rows)
+        await write_range(
+            self._exp_spreadsheet_id,
+            self._exp_tab_title,
+            f"A{sample_start + 1}:I{end_row}",
+            rows,
+        )
+
+        # Format: borders + fraction styling
+        sid = self._exp_tab_sheet_id
+        fmt: list[dict] = []
+        fmt.append(_update_borders_request(sid, sample_start, end_row, 0, 9))
+
+        # Color rows by treatment
+        if results.treatments:
+            for i, row in enumerate(rows):
+                treatment = row[1] if len(row) > 1 else ""
+                ti = next(
+                    (j for j, t in enumerate(results.treatments) if t == treatment),
+                    0,
+                )
+                color = TREATMENT_COLORS[ti % len(TREATMENT_COLORS)]
+                fmt.append(_repeat_cell_request(
+                    sid, sample_start + i, sample_start + i + 1, 0, 9,
+                    _cell_format(bg_hex=color),
+                ))
+
+        try:
+            await batch_format(self._exp_spreadsheet_id, fmt)
+        except Exception as exc:
+            logger.warning("Sample table formatting failed: %s", exc)
 
     @staticmethod
     def _extract_calc_fallback(reply: str) -> list[str]:
@@ -575,8 +823,16 @@ class ProtocolSession:
         calc_summary = ""
 
         if self._is_facs_method():
-            # Auto-generate plate layout from LLM reply if not written yet
-            if not self._plate_layout_written:
+            # Auto-generate plate layout from LLM reply
+            # Re-write if user reports missing treatments or requests update
+            need_plate = not self._plate_layout_written
+            if self._plate_layout_written:
+                low = text.lower()
+                if any(kw in low for kw in ("missing", "update plate", "fix plate",
+                                             "plate layout", "add treatment", "add group")):
+                    need_plate = True
+
+            if need_plate:
                 treatments = self._parse_treatments(text) or self._parse_treatments(reply)
                 if treatments:
                     try:
@@ -598,9 +854,11 @@ class ProtocolSession:
 
                 results = compute_facs(cell_data)
                 if results.samples:
-                    # Write to experiment sheet
+                    # Write calculator results to sheet
                     rows = format_sheet_rows(results)
                     await self._write_calc_rows(rows)
+                    # Write sample table to fixed section
+                    await self._write_sample_table(results)
                     # Format summary for Telegram
                     calc_summary = format_telegram_summary(results)
                     logger.info("FACS calculator: %d samples, %d warnings",

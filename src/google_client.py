@@ -602,3 +602,226 @@ def _append_row_sync(sheet_name: str, row: list) -> None:
 
 async def append_sheet_row(sheet_name: str, row: list) -> None:
     await _run(_append_row_sync, sheet_name, row)
+
+
+# ── Experiment sheet formatting ───────────────────────────────────────────────
+# Uses Sheets batchUpdate API for colors, borders, bold/underline, merges.
+
+
+def _rgb(hex_color: str) -> dict:
+    """Convert '#RRGGBB' to Sheets API color dict (0-1 floats)."""
+    h = hex_color.lstrip("#")
+    return {
+        "red": int(h[0:2], 16) / 255,
+        "green": int(h[2:4], 16) / 255,
+        "blue": int(h[4:6], 16) / 255,
+    }
+
+
+# Pastel color palette for sheet formatting
+COLORS = {
+    "single_stain": "#D6EAF8",   # light blue
+    "pbs": "#D5F5E3",            # light green
+    "treatment": "#FADBD8",       # light pink
+    "treatment2": "#F9E79F",      # light yellow
+    "treatment3": "#D7BDE2",      # light purple
+    "treatment4": "#F5CBA7",      # light orange
+    "header_bg": "#F2F3F4",       # light gray
+    "white": "#FFFFFF",
+}
+
+TREATMENT_COLORS = [
+    COLORS["pbs"], COLORS["treatment"], COLORS["treatment2"],
+    COLORS["treatment3"], COLORS["treatment4"],
+]
+
+
+def _border(style: str = "SOLID") -> dict:
+    return {"style": style, "width": 1, "color": _rgb("#BDBDBD")}
+
+
+def _borders_all() -> dict:
+    b = _border()
+    return {"top": b, "bottom": b, "left": b, "right": b}
+
+
+def _cell_format(
+    bold: bool = False,
+    italic: bool = False,
+    underline: bool = False,
+    bg_hex: str | None = None,
+    font_size: int | None = None,
+) -> dict:
+    fmt: dict = {}
+    text_fmt: dict = {}
+    if bold:
+        text_fmt["bold"] = True
+    if italic:
+        text_fmt["italic"] = True
+    if underline:
+        text_fmt["underline"] = True
+    if font_size:
+        text_fmt["fontSize"] = font_size
+    if text_fmt:
+        fmt["textFormat"] = text_fmt
+    if bg_hex:
+        fmt["backgroundColor"] = _rgb(bg_hex)
+    return fmt
+
+
+def _repeat_cell_request(
+    sheet_id: int,
+    start_row: int, end_row: int,
+    start_col: int, end_col: int,
+    cell_format: dict,
+    fields: str = "",
+) -> dict:
+    """Build a repeatCell request for a range."""
+    if not fields:
+        parts = []
+        if "textFormat" in cell_format:
+            parts.append("userEnteredFormat.textFormat")
+        if "backgroundColor" in cell_format:
+            parts.append("userEnteredFormat.backgroundColor")
+        fields = ",".join(parts) if parts else "userEnteredFormat"
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row,
+                "endRowIndex": end_row,
+                "startColumnIndex": start_col,
+                "endColumnIndex": end_col,
+            },
+            "cell": {"userEnteredFormat": cell_format},
+            "fields": fields,
+        }
+    }
+
+
+def _update_borders_request(
+    sheet_id: int,
+    start_row: int, end_row: int,
+    start_col: int, end_col: int,
+) -> dict:
+    return {
+        "updateBorders": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row,
+                "endRowIndex": end_row,
+                "startColumnIndex": start_col,
+                "endColumnIndex": end_col,
+            },
+            **_borders_all(),
+        }
+    }
+
+
+def _merge_cells_request(
+    sheet_id: int,
+    start_row: int, end_row: int,
+    start_col: int, end_col: int,
+) -> dict:
+    return {
+        "mergeCells": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row,
+                "endRowIndex": end_row,
+                "startColumnIndex": start_col,
+                "endColumnIndex": end_col,
+            },
+            "mergeType": "MERGE_ALL",
+        }
+    }
+
+
+def _batch_format_sync(
+    spreadsheet_id: str, requests: list[dict]
+) -> None:
+    """Apply a batch of formatting requests to a spreadsheet."""
+    if not requests:
+        return
+    svc = _get_service("sheets", "v4")
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+
+async def batch_format(spreadsheet_id: str, requests: list[dict]) -> None:
+    """Apply formatting requests (colors, borders, bold, etc.)."""
+    await _run(_batch_format_sync, spreadsheet_id, requests)
+
+
+def _write_range_sync(
+    spreadsheet_id: str, tab_title: str, range_str: str, rows: list[list],
+) -> None:
+    """Write data to a specific cell range (overwrites existing)."""
+    svc = _get_service("sheets", "v4")
+    safe_title = tab_title.replace("'", "''")
+    svc.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{safe_title}'!{range_str}",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
+
+
+async def write_range(
+    spreadsheet_id: str, tab_title: str, range_str: str, rows: list[list],
+) -> None:
+    """Write data to a specific cell range (overwrites existing)."""
+    await _run(_write_range_sync, spreadsheet_id, tab_title, range_str, rows)
+
+
+def _clear_range_sync(
+    spreadsheet_id: str, tab_title: str, range_str: str,
+) -> None:
+    """Clear data from a specific cell range."""
+    svc = _get_service("sheets", "v4")
+    safe_title = tab_title.replace("'", "''")
+    svc.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{safe_title}'!{range_str}",
+    ).execute()
+
+
+async def clear_range(
+    spreadsheet_id: str, tab_title: str, range_str: str,
+) -> None:
+    """Clear data from a specific cell range."""
+    await _run(_clear_range_sync, spreadsheet_id, tab_title, range_str)
+
+
+def _set_column_widths_sync(
+    spreadsheet_id: str, sheet_id: int, widths: list[tuple[int, int, int]],
+) -> None:
+    """Set column widths. widths: list of (start_col, end_col, pixel_width)."""
+    svc = _get_service("sheets", "v4")
+    requests = []
+    for start, end, px in widths:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": start,
+                    "endIndex": end,
+                },
+                "properties": {"pixelSize": px},
+                "fields": "pixelSize",
+            }
+        })
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+
+async def set_column_widths(
+    spreadsheet_id: str, sheet_id: int, widths: list[tuple[int, int, int]],
+) -> None:
+    """Set column widths. widths: list of (start_col, end_col, pixel_width)."""
+    await _run(_set_column_widths_sync, spreadsheet_id, sheet_id, widths)
