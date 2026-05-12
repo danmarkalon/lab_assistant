@@ -15,25 +15,32 @@ Researcher (Telegram)
         │
         ├─ Voice? ──► Whisper-1 (OpenAI) ──► transcript text
         │
-        ├─ Photo?  ──► Claude Vision (Anthropic) ──► analysis
+        ├─ Photo?  ──► Claude Vision (standalone) ──► analysis text ──► main agent
         │
         └─ Text / transcript
                 │
                 ▼
-     Protocol Expert Skill
-     ┌───────────────────────────────────┐
-     │  System Prompt =                  │
-     │    BASE_PROMPT                    │
-     │  + Protocol .docx text            │
-     │  + Companion knowledge Doc text   │
-     │  + Conversation history           │
-     └───────────────────────────────────┘
+     Protocol Expert Skill  ◄──── SkillIndex (keyword-based chunk retrieval)
+     ┌──────────────────────────────────────┐
+     │  System Prompt =                     │
+     │    BASE_PROMPT + Protocol .docx text  │
+     │  + Per-message relevant chunks from:  │
+     │    - Companion method_support Doc     │
+     │    - general_methods_assistant        │
+     │  + Conversation history               │
+     └──────────────────────────────────────┘
                 │
-                ▼
-          Google Drive
-          ├── Protocols/          (.docx — source of truth)
-          ├── Session Reports/    (one Google Doc per experiment)
-          └── Exports/
+                ├─► Google Drive (protocol storage + session reports)
+                ├─► Google Sheets (live experiment tabs per session)
+                └─► ChromaDB (experiment database — Open Project queries)
+
+          Google Drive — Lab Assistant/
+          ├── Bone Marrow FACS/
+          ├── Cell_franctionation/   ← cells + tissue protocol variants
+          │   └── database/         ← protocol docs per starting material
+          ├── HCR FISH/
+          ├── stability/
+          └── general protocols/    ← cross-method knowledge
 
           Google Sheets (Lab Assistant.gsheet)
           ├── Lab Journal
@@ -63,20 +70,32 @@ Researcher (Telegram)
 The central feature. When a session starts the bot dynamically becomes an expert in the chosen protocol.
 
 **Loading sequence:**
-1. User picks a protocol → `.docx` downloaded from Drive → body + tables extracted
-2. Companion Google Doc loaded if it exists (`{protocol_name}_context`)
-   - Contains: rationale, edge cases, known failure points, Gemini development history
-3. System prompt assembled: `BASE_PROMPT + Protocol text + Companion knowledge`
-4. Protocol version (filename + Drive `modifiedTime`) captured and stored in every record
+1. User picks a protocol → for Cell Fractionation, an additional "starting material" question (Cells vs Tissue) selects the correct protocol variant
+2. `.docx` or Google Doc downloaded from Drive → body + tables extracted
+3. Companion `method_support` Google Doc loaded if it exists (replaces legacy `{protocol_name}_context`)
+4. `general_methods_assistant` loaded (cross-method bench knowledge)
+5. Companion + general methods indexed into **SkillIndex** (keyword-based chunk retrieval, stays under token budget)
+6. System prompt assembled: `BASE_PROMPT + Protocol text` (lean base); relevant chunks injected per-message
+7. Protocol version (filename + Drive `modifiedTime`) captured and stored in every record
 
 **Session loop:**
-- Every message → `system_prompt + full history + new message` → Claude
-- Claude always has full protocol context and full session context simultaneously
+- Every message → SkillIndex selects relevant chunks → `system_prompt + chunks + full history + new message` → Claude
+- Live experiment sheet tab created per session; events logged in real time
+
+**Specialized behaviors:**
+- **Bone Marrow FACS**: auto-generates plate layouts, color-coded treatment groups, FACS cell calculations
+- **Cell Fractionation**: starting material question (cells vs tissue) loads the matching protocol variant from `database/`
 
 **Knowledge updates:**
 - `/refine` (anytime during session): user flags a finding → Claude drafts a dated knowledge note → appended to companion Google Doc immediately
 - `/end` prompt: bot asks "Any findings to save to the knowledge base?" → same flow
 - Over time: companion doc accumulates real-world experience across researchers
+
+**Open Project (Experiment Database):**
+- Say "open project experiment 547" or "open project [search term]"
+- Loads historical experiment data from ChromaDB vector database
+- Semantic search across all past experiments
+- Can populate data into the active experiment sheet
 
 ---
 
@@ -121,19 +140,27 @@ Each notebook is a development and documentation artifact. Code lives in `src/`;
 │
 ├── 🧪 Start Experiment
 │     ├── Lists protocols from Drive → user picks one
-│     ├── [Protocol Expert skill loads — full protocol + companion in context]
+│     ├── Cell Fractionation? → "Starting material?" (🧫 Cells / 🫀 Tissue)
+│     ├── User enters session objective
+│     ├── [Protocol Expert skill loads — protocol + SkillIndex context]
+│     ├── [Live experiment sheet tab created]
 │     ├── Any text/voice/photo → Protocol Expert → Claude responds with protocol context
-│     ├── /buffer [name]    → Claude reads recipe → asks target volume → returns volumes/weights
-│     ├── /deviation        → structured log: what changed vs. protocol step
-│     ├── /calculate        → dilution / molarity / unit conversion
-│     ├── /note             → explicit note entry
-│     ├── /refine           → Claude drafts knowledge update → appended to companion Doc
-│     └── /end              → session summary → Google Doc + Lab Journal row
+│     ├── 🔬 Buffer            → Claude reads recipe → asks target volume → returns volumes/weights
+│     ├── 📋 Deviation         → structured log: what changed vs. protocol step
+│     ├── 🧮 Calculate         → dilution / molarity / unit conversion
+│     ├── 📝 Note              → explicit note entry (timestamped)
+│     ├── 📚 Refine            → Claude drafts knowledge update → appended to companion Doc
+│     ├── "open project ..."   → load experiment data from ChromaDB
+│     └── 🔚 End Session       → session summary → Lab Journal row + experiment sheet
 │
-└── 📦 Stock Orders (available always)
-      ├── /order_item   → add row to Stock Orders sheet
-      ├── /view_orders  → show Needed/Ordered items
-      └── /mark_arrived → photo support (Claude extracts lot #) → Received Supplies row
+├── 📦 Stock Orders (available always)
+│     ├── /order_item   → add row to Stock Orders sheet
+│     ├── /view_orders  → show Needed/Ordered items
+│     └── /mark_arrived → photo support (Claude extracts lot #) → Received Supplies row
+│
+├── /settings → name, model preferences
+│
+└── Outside session: text/voice/photo → general lab AI assistant
 ```
 
 ---
@@ -191,21 +218,32 @@ Deliverable:
 ```
 lab_assistant/
 ├── PLAN.md
-├── .env.example          ← copy to .env and fill in your keys
+├── general_methods_assistant.md  ← cross-method bench knowledge (local fallback)
+├── .env.example                  ← copy to .env and fill in your keys
 ├── .gitignore
 ├── requirements.txt
-├── service_account.json  ← Google service account key (NOT committed to git)
+├── setup.py
+├── service_account.json          ← Google service account key (NOT committed to git)
+├── chroma_db/                    ← ChromaDB vector database (experiment records)
+│   └── sync_state.json
+├── scripts/
+│   ├── fill_general_methods.py   ← generate cross-method knowledge via Gemini
+│   ├── fill_method_support.py    ← generate per-method companion docs via Gemini
+│   └── read_hcr_fish.py
 ├── src/
 │   ├── __init__.py
-│   ├── config.py         ← loads .env, all constants
-│   ├── claude_client.py  ← AsyncAnthropic, ConversationHistory, system prompt builder
-│   ├── transcription.py  ← Whisper-1 OGG transcription
-│   ├── google_client.py  ← Drive / Sheets / Docs (Phase 2)
-│   ├── protocol_loader.py← docx parse + companion Doc (Phase 2)
-│   ├── protocol_skill.py ← Protocol Expert skill (Phase 2)
-│   ├── stock.py          ← Stock order management (Phase 4)
-│   ├── handlers.py       ← All Telegram handlers (Phase 2)
-│   └── main.py           ← Entry point
+│   ├── config.py                 ← loads .env, all constants
+│   ├── claude_client.py          ← AsyncAnthropic, ConversationHistory, system prompt builder
+│   ├── transcription.py          ← Whisper-1 OGG transcription with retry
+│   ├── google_client.py          ← Drive / Sheets / Docs (protocol discovery + I/O)
+│   ├── protocol_loader.py        ← docx parse + companion Doc loading
+│   ├── protocol_skill.py         ← ProtocolSession: skill, sheet logging, FACS specialization
+│   ├── skill_retrieval.py        ← SkillIndex: keyword-based chunk retrieval under token budget
+│   ├── experiment_db.py          ← ChromaDB experiment database (Open Project)
+│   ├── facs_calculator.py        ← Bone Marrow FACS cell count & dilution calculator
+│   ├── user_settings.py          ← per-user name/model preferences
+│   ├── handlers.py               ← Telegram ConversationHandler: all states & handlers
+│   └── main.py                   ← Entry point
 └── notebooks/
     ├── 01_config.ipynb
     ├── 02_google_client.ipynb

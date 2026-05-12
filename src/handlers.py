@@ -128,6 +128,7 @@ REFINE_ENTRY        = 4
 CONFIRM_END         = 5
 PROJECT_ACTIVE      = 6
 PROJECT_SELECT      = 7
+STARTING_MATERIAL   = 8
 
 # Settings conversation states (offset to avoid collision)
 SETTINGS_MENU       = 10
@@ -668,8 +669,67 @@ async def select_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     context.user_data["selected_protocol"] = protocols[idx]
+
+    # Cell Fractionation has two protocol variants — ask about starting material
+    if "fractionat" in protocols[idx]["name"].lower():
+        keyboard = [
+            [InlineKeyboardButton("🧫 Cultured Cells", callback_data="material:cells")],
+            [InlineKeyboardButton("🫀 Tissue", callback_data="material:tissue")],
+        ]
+        await query.edit_message_text(
+            f"Protocol: *{protocols[idx]['name']}*\n\n"
+            "What is your starting material?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return STARTING_MATERIAL
+
     await query.edit_message_text(
         f"Protocol: *{protocols[idx]['name']}*\n\n"
+        "What is the objective or target for this session?",
+        parse_mode="Markdown",
+    )
+    return AWAITING_OBJECTIVE
+
+
+# ── STARTING_MATERIAL state (Cell Fractionation variant) ─────────────────────
+
+# Protocol doc IDs for Cell Fractionation variants (database/ subfolder)
+_FRACTIONATION_VARIANTS = {
+    "cells": {
+        "id": "1EmavPeXuidUgwSWT84gLnoaUYpUOqj-5sI7tkebh4PQ",
+        "docx_name": "Cell Fractionation Protocol with Stops for cells",
+        "is_gdoc": True,
+    },
+    "tissue": {
+        "id": "1QREgvJtDRNOood22XbXxhViAdXZBw_ERjnkwptc__sM",
+        "docx_name": "Cell Fractionation Protocol with Stops for tissue",
+        "is_gdoc": True,
+    },
+}
+
+
+async def select_starting_material(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle starting material selection for Cell Fractionation."""
+    query = update.callback_query
+    await query.answer()
+    material = query.data.split(":")[1]  # 'cells' or 'tissue'
+
+    protocol = context.user_data["selected_protocol"]
+    variant = _FRACTIONATION_VARIANTS.get(material)
+    if variant:
+        # Override protocol doc to load the correct variant
+        protocol["id"] = variant["id"]
+        protocol["docx_name"] = variant["docx_name"]
+        protocol["is_gdoc"] = variant["is_gdoc"]
+    context.user_data["selected_protocol"] = protocol
+    context.user_data["starting_material"] = material
+
+    label = "Cultured Cells" if material == "cells" else "Tissue"
+    await query.edit_message_text(
+        f"Protocol: *{protocol['name']}* ({label})\n\n"
         "What is the objective or target for this session?",
         parse_mode="Markdown",
     )
@@ -1215,6 +1275,9 @@ def build_conversation_handler() -> ConversationHandler:
         states={
             PROTOCOL_SELECT: [
                 CallbackQueryHandler(select_protocol, pattern=r"^proto:\d+$"),
+            ],
+            STARTING_MATERIAL: [
+                CallbackQueryHandler(select_starting_material, pattern=r"^material:(cells|tissue)$"),
             ],
             AWAITING_OBJECTIVE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_objective),
