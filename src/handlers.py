@@ -50,7 +50,9 @@ from .google_client import (
     append_experiment_rows,
     create_experiment_tab,
     get_sheet_url,
+    list_database_folder,
     list_protocols,
+    read_database_file,
 )
 from .protocol_skill import ProtocolSession
 from .transcription import transcribe_ogg
@@ -129,6 +131,7 @@ CONFIRM_END         = 5
 PROJECT_ACTIVE      = 6
 PROJECT_SELECT      = 7
 STARTING_MATERIAL   = 8
+DATABASE_BROWSE     = 9
 
 # Settings conversation states (offset to avoid collision)
 SETTINGS_MENU       = 10
@@ -168,7 +171,8 @@ def _session_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             ["🔬 Buffer", "🧮 Calculate"],
             ["📋 Deviation", "📝 Note"],
-            ["📚 Refine", "🔚 End Session"],
+            ["📚 Refine", "� Database"],
+            ["�🔚 End Session"],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -516,7 +520,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = settings_get_name(user_id, tg_name)
     keyboard = [
         [InlineKeyboardButton("🧪 Start Experiment", callback_data="menu:start_experiment")],
-        [InlineKeyboardButton("📦 Stock Orders", callback_data="menu:stock")],
+        [InlineKeyboardButton("� Resume Session", callback_data="menu:resume")],
+        [InlineKeyboardButton("�📦 Stock Orders", callback_data="menu:stock")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
     ]
     await update.message.reply_text(
@@ -539,6 +544,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/calculate \\[query\\] — dilutions, molarity, unit conversions\n"
         "/refine — add a knowledge note to the protocol's knowledge base\n"
         "/note \\[text\\] — add an explicit timestamped note\n"
+        "/database \\[path\\] — browse files in the protocol's database/ folder\n"
         "/end — close the session and save to Google Drive\n"
         "/cancel — abandon session without saving\n\n"
         "*Open Project (experiment database):*\n"
@@ -605,11 +611,119 @@ async def handle_menu_callback(
         )
         return ConversationHandler.END
 
+    elif action == "resume":
+        user_id = update.effective_user.id
+        from .session_store import list_sessions
+        sessions = list_sessions(user_id)
+        if not sessions:
+            await query.edit_message_text(
+                "No saved sessions to resume. Start a new experiment with /start\\_experiment.",
+                parse_mode="Markdown",
+            )
+            return ConversationHandler.END
+        context.user_data["resume_sessions"] = sessions
+        keyboard = [
+            [InlineKeyboardButton(
+                f"{s['protocol_name']} — {s['session_date']}",
+                callback_data=f"resume:{i}",
+            )]
+            for i, s in enumerate(sessions)
+        ]
+        await query.edit_message_text(
+            "🔄 Select a session to resume:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return PROTOCOL_SELECT
+
     elif action == "stock":
         await query.edit_message_text("📦 Stock order management is coming in the next phase.")
         return ConversationHandler.END
 
     return ConversationHandler.END
+
+
+# ── Entry point: /resume ──────────────────────────────────────────────────────
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """List saved sessions for this user and let them pick one to resume."""
+    if not await _check_allowed(update):
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+
+    from .session_store import list_sessions
+    sessions = list_sessions(user_id)
+
+    if not sessions:
+        await update.message.reply_text(
+            "No saved sessions to resume. Start a new experiment with /start\\_experiment.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    # Store sessions for callback lookup
+    context.user_data["resume_sessions"] = sessions
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{s['protocol_name']} — {s['session_date']}",
+            callback_data=f"resume:{i}",
+        )]
+        for i, s in enumerate(sessions)
+    ]
+    await update.message.reply_text(
+        "🔄 Select a session to resume:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return PROTOCOL_SELECT
+
+
+async def resume_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle session resume selection from the inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    idx = int(query.data.split(":")[1])
+    sessions: list = context.user_data.get("resume_sessions", [])
+    if idx >= len(sessions):
+        await query.edit_message_text("Session not found. Use /resume to try again.")
+        return ConversationHandler.END
+
+    state = sessions[idx]
+    user_id = update.effective_user.id
+
+    await query.edit_message_text(
+        f"⏳ Resuming *{state['protocol_name']}* ({state['session_date']})...",
+        parse_mode="Markdown",
+    )
+
+    try:
+        session = await ProtocolSession.resume(state=state, user_id=user_id)
+    except Exception as exc:
+        logger.error("Failed to resume session: %s", exc)
+        await query.edit_message_text(
+            f"⚠️ Failed to resume session: {exc}\n\nStart fresh with /start\\_experiment.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    context.user_data["session"] = session
+    session._user_id = user_id
+
+    exp_text = (
+        f"📝 Live experiment log: [open sheet]({session.experiments_sheet_url})" if session._exp_spreadsheet_id
+        else ""
+    )
+    await query.edit_message_text(
+        f"✅ *Session Resumed*\n"
+        f"Protocol: `{session.protocol_name}`\n"
+        f"Date: `{session.session_date}`\n"
+        f"{exp_text}\n\n"
+        f"Continuing from where you left off. Ask questions or send voice/photos.",
+        parse_mode="Markdown",
+        reply_markup=_session_keyboard(),
+    )
+    return EXPERIMENT_ACTIVE
 
 
 # ── Entry point: /start_experiment ───────────────────────────────────────────
@@ -671,7 +785,8 @@ async def select_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["selected_protocol"] = protocols[idx]
 
     # Cell Fractionation has two protocol variants — ask about starting material
-    if "fractionat" in protocols[idx]["name"].lower():
+    # Note: folder name has a typo ("franctionation") so we match both spellings
+    if "fractionat" in protocols[idx]["name"].lower() or "franctionat" in protocols[idx]["name"].lower():
         keyboard = [
             [InlineKeyboardButton("🧫 Cultured Cells", callback_data="material:cells")],
             [InlineKeyboardButton("🫀 Tissue", callback_data="material:tissue")],
@@ -765,6 +880,7 @@ async def receive_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return AWAITING_OBJECTIVE
 
     context.user_data["session"] = session
+    session._user_id = user_id
 
     kb_text = (
         "📚 Knowledge base: loaded ✅" if session.companion_doc_id
@@ -886,6 +1002,11 @@ async def _button_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return REFINE_ENTRY
 
 
+async def _button_database(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.args = []
+    return await cmd_database(update, context)
+
+
 async def cmd_buffer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session = _get_session(context)
     if not session:
@@ -964,6 +1085,214 @@ async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         parse_mode="Markdown",
     )
     return CONFIRM_END
+
+
+# ── DATABASE BROWSE ───────────────────────────────────────────────────────────
+
+
+async def cmd_database(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /database command — browse the database/ subfolder of the active protocol."""
+    session = _get_session(context)
+    if not session:
+        await update.message.reply_text(
+            "⚠️ No active experiment session. Start one with /start_experiment first."
+        )
+        return EXPERIMENT_ACTIVE
+
+    if not session.protocol_folder_id:
+        await update.message.reply_text("⚠️ No protocol folder ID available.")
+        return EXPERIMENT_ACTIVE
+
+    await update.message.chat.send_action("typing")
+
+    # Determine subfolder path from command args
+    subfolder = " ".join(context.args).strip() if context.args else ""
+
+    contents = await list_database_folder(session.protocol_folder_id, subfolder)
+    if contents is None:
+        if subfolder:
+            await update.message.reply_text(
+                f"📁 Subfolder not found: <code>database/{subfolder}</code>\n\n"
+                "Use /database to list the root database/ folder.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "📁 No <code>database/</code> folder found in this protocol's Drive folder.\n\n"
+                "Create a subfolder named <b>database</b> in your protocol folder on Google Drive "
+                "and add your reference files there.",
+                parse_mode="HTML",
+            )
+        return EXPERIMENT_ACTIVE
+
+    if not contents:
+        await update.message.reply_text("📁 The folder is empty.")
+        return EXPERIMENT_ACTIVE
+
+    # Store contents for callback selection
+    context.user_data["db_contents"] = contents
+    context.user_data["db_path"] = subfolder
+
+    # Build inline keyboard for selection
+    buttons = []
+    for i, item in enumerate(contents):
+        icon = "📁" if item["is_folder"] else "📄"
+        buttons.append([InlineKeyboardButton(
+            f"{icon} {item['name']}", callback_data=f"dbfile:{i}"
+        )])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dbfile:cancel")])
+
+    path_display = f"database/{subfolder}" if subfolder else "database/"
+    await update.message.reply_text(
+        f"📁 <b>{path_display}</b>\n\n"
+        "Select a file to read or a folder to open:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return DATABASE_BROWSE
+
+
+async def database_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle selection from the database file/folder list."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "dbfile:cancel":
+        await query.edit_message_text("📁 Database browser closed.")
+        return EXPERIMENT_ACTIVE
+
+    idx = int(data.split(":")[1])
+    contents = context.user_data.get("db_contents", [])
+    current_path = context.user_data.get("db_path", "")
+
+    if idx >= len(contents):
+        await query.edit_message_text("⚠️ Invalid selection.")
+        return EXPERIMENT_ACTIVE
+
+    item = contents[idx]
+    session = _get_session(context)
+
+    if item["is_folder"]:
+        # Navigate into subfolder
+        new_path = f"{current_path}/{item['name']}" if current_path else item["name"]
+        sub_contents = await list_database_folder(session.protocol_folder_id, new_path)
+
+        if not sub_contents:
+            await query.edit_message_text(f"📁 Folder <b>{item['name']}</b> is empty.", parse_mode="HTML")
+            return EXPERIMENT_ACTIVE
+
+        # Update stored state and show new contents
+        context.user_data["db_contents"] = sub_contents
+        context.user_data["db_path"] = new_path
+
+        buttons = []
+        for i, sub_item in enumerate(sub_contents):
+            icon = "📁" if sub_item["is_folder"] else "📄"
+            buttons.append([InlineKeyboardButton(
+                f"{icon} {sub_item['name']}", callback_data=f"dbfile:{i}"
+            )])
+        buttons.append([InlineKeyboardButton("⬆️ Back", callback_data="dbfile:back")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dbfile:cancel")])
+
+        await query.edit_message_text(
+            f"📁 <b>database/{new_path}</b>\n\n"
+            "Select a file to read or a folder to open:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return DATABASE_BROWSE
+
+    # It's a file — read it and feed to the session
+    await query.edit_message_text(f"⏳ Reading <b>{item['name']}</b>...", parse_mode="HTML")
+
+    try:
+        content = await read_database_file(item["id"], item["mimeType"])
+    except Exception as exc:
+        logger.error("Failed to read database file %s: %s", item["name"], exc)
+        await query.edit_message_text(f"⚠️ Could not read file: {exc}")
+        return EXPERIMENT_ACTIVE
+
+    # Truncate if very long (protect context window)
+    if len(content) > 15000:
+        content = content[:15000] + "\n\n... [truncated — file too long to display fully]"
+
+    # Feed the file content into the session's skill index for retrieval
+    if session:
+        from .skill_retrieval import clean_whitespace
+        n = session._skill_index.add_document(
+            clean_whitespace(content), source=f"database/{item['name']}"
+        )
+        logger.info("Indexed %d chunks from database file '%s'", n, item["name"])
+
+        # Also inject into conversation history so the AI always knows about it
+        session.history.add_user(
+            f"[DATABASE FILE LOADED: {item['name']}]\n\n{content}"
+        )
+        session.history.add_assistant(
+            f"I've loaded and reviewed the file '{item['name']}'. "
+            "I can see all its contents and will use this information in our conversation."
+        )
+
+    # Also send a preview to the user
+    preview = content[:2000]
+    if len(content) > 2000:
+        preview += "\n\n... [showing first 2000 chars]"
+
+    await query.message.reply_text(
+        f"📄 <b>{item['name']}</b> loaded into session context.\n\n"
+        f"<pre>{_escape_html(preview)}</pre>\n\n"
+        "You can now ask questions about this file.",
+        parse_mode="HTML",
+    )
+    return EXPERIMENT_ACTIVE
+
+
+async def database_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the 'Back' button in database browser — go up one level."""
+    query = update.callback_query
+    await query.answer()
+
+    session = _get_session(context)
+    current_path = context.user_data.get("db_path", "")
+
+    # Go up one level
+    if "/" in current_path:
+        parent_path = current_path.rsplit("/", 1)[0]
+    else:
+        parent_path = ""
+
+    contents = await list_database_folder(session.protocol_folder_id, parent_path)
+    if not contents:
+        await query.edit_message_text("📁 Could not navigate back.")
+        return EXPERIMENT_ACTIVE
+
+    context.user_data["db_contents"] = contents
+    context.user_data["db_path"] = parent_path
+
+    buttons = []
+    for i, item in enumerate(contents):
+        icon = "📁" if item["is_folder"] else "📄"
+        buttons.append([InlineKeyboardButton(
+            f"{icon} {item['name']}", callback_data=f"dbfile:{i}"
+        )])
+    if parent_path:
+        buttons.append([InlineKeyboardButton("⬆️ Back", callback_data="dbfile:back")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dbfile:cancel")])
+
+    path_display = f"database/{parent_path}" if parent_path else "database/"
+    await query.edit_message_text(
+        f"📁 <b>{path_display}</b>\n\n"
+        "Select a file to read or a folder to open:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return DATABASE_BROWSE
+
+
+def _escape_html(text: str) -> str:
+    """Escape HTML special chars for use inside <pre> tags."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ── DEVIATION_ENTRY state ─────────────────────────────────────────────────────
@@ -1270,11 +1599,13 @@ def build_conversation_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CommandHandler("start_experiment", cmd_start_experiment),
+            CommandHandler("resume", cmd_resume),
             CallbackQueryHandler(handle_menu_callback, pattern=r"^menu:"),
         ],
         states={
             PROTOCOL_SELECT: [
                 CallbackQueryHandler(select_protocol, pattern=r"^proto:\d+$"),
+                CallbackQueryHandler(resume_callback, pattern=r"^resume:\d+$"),
             ],
             STARTING_MATERIAL: [
                 CallbackQueryHandler(select_starting_material, pattern=r"^material:(cells|tissue)$"),
@@ -1288,6 +1619,7 @@ def build_conversation_handler() -> ConversationHandler:
                 CommandHandler("note", cmd_note),
                 CommandHandler("deviation", cmd_deviation),
                 CommandHandler("refine", cmd_refine),
+                CommandHandler("database", cmd_database),
                 CommandHandler("end", cmd_end),
                 # Reply keyboard button shortcuts
                 MessageHandler(filters.Regex(r"^🔬 Buffer$"), _button_buffer),
@@ -1295,6 +1627,7 @@ def build_conversation_handler() -> ConversationHandler:
                 MessageHandler(filters.Regex(r"^📋 Deviation$"), cmd_deviation),
                 MessageHandler(filters.Regex(r"^📝 Note$"), _button_note),
                 MessageHandler(filters.Regex(r"^📚 Refine$"), cmd_refine),
+                MessageHandler(filters.Regex(r"^.{1,3}\s*Database$"), _button_database),
                 MessageHandler(filters.Regex(r"^🔚 End Session$"), cmd_end),
                 MessageHandler(filters.VOICE, active_voice),
                 MessageHandler(filters.PHOTO, active_photo),
@@ -1308,6 +1641,10 @@ def build_conversation_handler() -> ConversationHandler:
             ],
             CONFIRM_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_end_findings),
+            ],
+            DATABASE_BROWSE: [
+                CallbackQueryHandler(database_back, pattern=r"^dbfile:back$"),
+                CallbackQueryHandler(database_callback, pattern=r"^dbfile:"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],

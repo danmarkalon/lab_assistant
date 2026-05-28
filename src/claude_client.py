@@ -43,9 +43,9 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_TURNS: int = 10
 
 # ── Model fallback chain ──────────────────────────────────────────────────────
-# Only models confirmed to have free-tier quota on this key.
-# gemini-2.5-flash: primary (best quality, occasionally 503s under high load)
-# gemini-2.5-flash-lite: reliable fallback with separate quota pool
+# Model cascade: each has its own daily quota pool.
+# gemini-2.0-flash: primary (1500 RPD free tier, fast, reliable)
+# gemini-2.5-flash-lite: fallback (separate quota pool)
 _FALLBACK_MODELS: list[str] = [
     GEMINI_MODEL,
     "gemini-2.5-flash-lite",
@@ -282,12 +282,16 @@ async def _generate_with_fallback(
     last_exc: genai_errors.APIError | None = None
     notified = False
     backoff = 1.0
+    daily_exhausted: set[str] = set()  # models that hit daily quota — never retry
 
     # Pass 1: fast cascade (503 = skip immediately, RPM = backoff then skip).
     # Pass 2: wait 15s, then retry the full chain again (503 spikes are brief).
     # Pass 3: wait 30s, final attempt on full chain.
     for chain_pass in range(3):
         if chain_pass > 0:
+            # If all models hit daily quota, stop immediately
+            if daily_exhausted >= set(MODEL_CHAIN):
+                break
             wait = 15 if chain_pass == 1 else 30
             logger.warning("Pass %d: all models failed, waiting %ds then retrying full chain", chain_pass + 1, wait)
             if not notified and notify_retry:
@@ -296,6 +300,8 @@ async def _generate_with_fallback(
             await asyncio.sleep(wait)
 
         for model in MODEL_CHAIN:
+            if model in daily_exhausted:
+                continue  # skip models with no daily quota left
             # Up to 3 attempts per model for RPM backoff; 503 cascades immediately
             for attempt in range(3):
                 if _throttle_delay > 0:
@@ -315,12 +321,13 @@ async def _generate_with_fallback(
                     logger.warning("API error %d (%s) on %s pass %d attempt %d",
                                    err_code, type(exc).__name__, model, chain_pass + 1, attempt + 1)
 
-                    # Daily quota on this model — cascade to next, only stop if last
+                    # Daily quota on this model — mark exhausted and cascade
                     if _is_daily_error(exc):
-                        logger.warning("Daily quota hit on %s, cascading", model)
-                        if model == MODEL_CHAIN[-1]:
+                        logger.warning("Daily quota hit on %s, marking exhausted", model)
+                        daily_exhausted.add(model)
+                        if daily_exhausted >= set(MODEL_CHAIN):
                             return _friendly_api_error(exc)
-                        break  # try next model
+                        break  # try next model (skip remaining passes for this model)
 
                     # 503 — model is overloaded, cascade to next model immediately
                     if err_code == 503:

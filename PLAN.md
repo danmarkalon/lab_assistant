@@ -256,3 +256,65 @@ lab_assistant/
     ├── 09_main.ipynb
     └── 10_deployment.ipynb
 ```
+
+---
+
+## Phase 3: Session Resume (planned)
+
+Multi-day experiments need the ability to pause and resume sessions without losing
+the experiment sheet or conversation context.
+
+### What survives a restart
+
+| Data | Currently | Resume strategy |
+|------|-----------|-----------------|
+| Protocol/folder | In-memory | Re-derive from stored folder_id |
+| Spreadsheet ID + tab | In-memory | Persist in JSON |
+| Conversation history | In-memory | Rebuild from sheet event rows |
+| Objective | In-memory | Persist in JSON |
+| Researcher name | In-memory | Persist in JSON |
+| Event log | In-memory + sheet | Sheet is source of truth |
+| Database files loaded | In-memory skill_index | User re-loads if needed |
+| Plate layout state | In-memory flags | Check if sheet already has layout |
+
+### Implementation
+
+**Storage**: `data/sessions/{user_id}.json` per user, tracking paused sessions:
+
+```json
+{
+  "active_session": {
+    "protocol_name": "Bone Marrow FACS",
+    "protocol_folder_id": "...",
+    "folder_name": "Bone Marrow FACS",
+    "spreadsheet_id": "1zTr9AFE...",
+    "tab_title": "2026-05-18 — דן",
+    "tab_sheet_id": 814043357,
+    "objective": "Assess biodistribution...",
+    "researcher_name": "דן",
+    "session_date": "2026-05-18",
+    "plate_layout_written": true,
+    "known_treatments": ["Vehicle Control", "NOV340 15mg IV"]
+  }
+}
+```
+
+**Commands**:
+- `/resume` — list paused sessions, pick one to continue
+- Auto-save on every sheet write (tab creation, deviations, notes, buffers)
+- On `end_session` — delete saved state
+
+**Resume flow**:
+1. `/resume` → show saved session(s) as inline buttons
+2. User picks one → re-create `ProtocolSession` with existing tab (no new tab)
+3. Re-index protocol chunks into SkillIndex
+4. Read last ~20 rows from sheet → inject as conversation context
+5. Bot: "Resuming Bone Marrow FACS from 2026-05-18. Reading back progress..."
+6. User continues working — all new events append to the same sheet tab
+
+**Components to build**:
+- `src/session_store.py` — JSON read/write for `data/sessions/`
+- Save hooks in `ProtocolSession` (after tab creation + each sheet write)
+- `ProtocolSession.resume()` classmethod (skip tab creation, load existing state)
+- `/resume` command + handler in `handlers.py`
+- Read-back logic: fetch last N rows from sheet tab via Sheets API

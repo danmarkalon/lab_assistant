@@ -142,9 +142,10 @@ _LAB_TERMS = {
     "dilution", "c1v1", "molarity", "molar", "stock", "working",
     "volume", "weight", "concentration", "master mix",
     # Sample prep
-    "fractionation", "separation", "isolation", "purification",
+    "fractionation", "franctionation", "separation", "isolation", "purification",
     "magnetic", "column", "beads", "selection", "depletion",
-    "enrichment",
+    "enrichment", "tissue", "homogeniz", "gentlemacs", "dissociat",
+    "strainer", "mince", "sucrose", "cushion",
 }
 
 # Common words to ignore

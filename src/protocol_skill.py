@@ -47,6 +47,7 @@ from .google_client import (
     find_experiments_sheet_id,
     get_sheet_url,
     load_general_methods,
+    read_sheet_rows,
     set_column_widths,
     write_range,
     COLORS,
@@ -133,6 +134,147 @@ class ProtocolSession:
         self._plate_layout_written: bool = False  # track if FACS plate layout has been written
         self._known_treatments: list[str] = []  # accumulated treatment groups
         self._skill_index: SkillIndex = SkillIndex()  # keyword-based context retrieval
+        self._user_id: int = 0  # set externally for session persistence
+
+    # ── Session persistence ──────────────────────────────────────────────────
+
+    def to_state_dict(self) -> dict:
+        """Serialize minimal session state for JSON persistence."""
+        return {
+            "protocol_name": self.protocol_name,
+            "protocol_version": self.protocol_version,
+            "protocol_folder_id": self.protocol_folder_id,
+            "folder_name": self.folder_name,
+            "spreadsheet_id": self._exp_spreadsheet_id or "",
+            "tab_title": self._exp_tab_title,
+            "tab_sheet_id": self._exp_tab_sheet_id,
+            "objective": self.objective,
+            "researcher_name": self.researcher_name,
+            "session_date": self.session_date,
+            "plate_layout_written": self._plate_layout_written,
+            "known_treatments": self._known_treatments,
+        }
+
+    def save_state(self) -> None:
+        """Persist current session state to disk (call after sheet writes)."""
+        if not self._user_id:
+            return
+        from .session_store import save_session
+        save_session(self._user_id, self.to_state_dict())
+
+    @classmethod
+    async def resume(
+        cls,
+        state: dict,
+        user_id: int,
+    ) -> "ProtocolSession":
+        """Reconstruct a session from persisted state without creating a new tab.
+
+        Re-indexes the protocol and reads back recent sheet rows as context.
+        """
+        from .protocol_loader import load_protocol
+
+        # Build protocol dict for load_protocol
+        folder_name = state["folder_name"]
+        folder_id = state["protocol_folder_id"]
+
+        # Load protocol text for skill indexing
+        protocol_text = ""
+        companion_text = ""
+        protocol_name = state["protocol_name"]
+        protocol_version = state["protocol_version"]
+
+        # Try to reload protocol from Drive
+        try:
+            from .google_client import list_protocols
+            protocols = await list_protocols()
+            # Find matching protocol
+            for p in protocols:
+                if p.get("name") == folder_name or p.get("folder_id") == folder_id:
+                    protocol_text, companion_text, protocol_name, protocol_version, _ = (
+                        await load_protocol(
+                            file_id=p["id"],
+                            file_name=p["docx_name"],
+                            modified_time=p.get("modifiedTime", ""),
+                            parent_folder_id=p.get("folder_id", ""),
+                            folder_name=p.get("name", ""),
+                            is_gdoc=p.get("is_gdoc", False),
+                        )
+                    )
+                    break
+        except Exception as exc:
+            logger.warning("Could not reload protocol for resume: %s", exc)
+
+        is_facs = "bone marrow" in folder_name.lower() and "facs" in folder_name.lower()
+
+        system_prompt = build_system_prompt(
+            protocol_text=None,
+            protocol_name=protocol_name,
+            protocol_version=protocol_version,
+            is_facs=is_facs,
+        )
+
+        session = cls(
+            protocol_name=protocol_name,
+            protocol_version=protocol_version,
+            companion_doc_id=None,
+            researcher_name=state["researcher_name"],
+            objective=state["objective"],
+            system_prompt=system_prompt,
+            protocol_folder_id=folder_id,
+            folder_name=folder_name,
+            experiments_spreadsheet_id=state.get("spreadsheet_id") or None,
+        )
+
+        # Restore persisted state (skip tab creation)
+        session._exp_tab_title = state["tab_title"]
+        session._exp_tab_sheet_id = state["tab_sheet_id"]
+        session._plate_layout_written = state.get("plate_layout_written", False)
+        session._known_treatments = state.get("known_treatments", [])
+        session.session_date = state.get("session_date", session.session_date)
+        session._user_id = user_id
+
+        # Re-index protocol
+        if protocol_text and protocol_text.strip():
+            n = session._skill_index.add_document(clean_whitespace(protocol_text), source="Protocol")
+            logger.info("Resume: indexed %d protocol chunks for '%s'", n, protocol_name)
+
+        # Index general methods
+        general_methods_text = await load_general_methods()
+        if general_methods_text and general_methods_text.strip():
+            session._skill_index.add_document(clean_whitespace(general_methods_text), source="General Methods")
+
+        # Read back recent rows from the experiment sheet as conversation context
+        if session._exp_spreadsheet_id and session._exp_tab_title:
+            try:
+                rows = await read_sheet_rows(
+                    session._exp_spreadsheet_id, session._exp_tab_title, max_rows=25
+                )
+                if rows:
+                    # Format as readable context and inject into history
+                    context_lines = []
+                    for row in rows:
+                        line = " | ".join(str(c) for c in row if c)
+                        if line.strip():
+                            context_lines.append(line)
+                    if context_lines:
+                        context_text = "\n".join(context_lines)
+                        session.history.add_user(
+                            f"[SESSION RESUMED — Previous experiment log from {session.session_date}]\n\n"
+                            f"{context_text}"
+                        )
+                        session.history.add_assistant(
+                            f"Session resumed. I can see the previous log entries from {session.session_date}. "
+                            "I'll continue from where we left off. What would you like to do next?"
+                        )
+                        logger.info("Resume: injected %d sheet rows as context", len(context_lines))
+            except Exception as exc:
+                logger.warning("Resume: could not read back sheet rows: %s", exc)
+
+        # Log the resume event to the sheet
+        await session._sheet_log("🔄 Session Resumed", f"by {session.researcher_name}")
+
+        return session
 
     @classmethod
     async def create(
@@ -176,10 +318,11 @@ class ProtocolSession:
 
         is_facs = "bone marrow" in folder_name.lower() and "facs" in folder_name.lower()
 
-        # Build a lean base system prompt with just protocol text (always relevant).
-        # Companion + general methods go into the SkillIndex for per-message retrieval.
+        # Build a lean base system prompt WITHOUT protocol text.
+        # Protocol, companion, and general methods all go into the SkillIndex
+        # so only relevant sections are retrieved per message (saves tokens).
         system_prompt = build_system_prompt(
-            protocol_text=clean_whitespace(protocol_text) if protocol_text else None,
+            protocol_text=None,  # indexed in SkillIndex instead
             protocol_name=protocol_name,
             protocol_version=protocol_version,
             is_facs=is_facs,
@@ -197,6 +340,11 @@ class ProtocolSession:
             experiments_spreadsheet_id=exp_sheet_id,
         )
 
+        # Index protocol text for per-message retrieval (highest priority source)
+        if protocol_text and protocol_text.strip():
+            n = session._skill_index.add_document(clean_whitespace(protocol_text), source="Protocol")
+            logger.info("Indexed %d chunks from protocol for '%s'", n, protocol_name)
+
         # Build skill index from companion doc + cross-method knowledge
         if companion_text and companion_text.strip():
             n = session._skill_index.add_document(clean_whitespace(companion_text), source=folder_name)
@@ -209,6 +357,9 @@ class ProtocolSession:
 
         # Create a new tab for this experiment and write header
         await session._sheet_init()
+
+        # Persist state so session can be resumed
+        session.save_state()
 
         return session
 
@@ -562,6 +713,7 @@ class ProtocolSession:
             logger.warning("Plate layout formatting failed: %s", exc)
 
         self._plate_layout_written = True
+        self.save_state()
         logger.info("Wrote FACS plate layout for treatments: %s", treatments)
 
     def _parse_treatments(self, text: str) -> list[str]:
@@ -1026,4 +1178,10 @@ class ProtocolSession:
         )
 
         logger.info("Session ended: '%s' — experiment sheet at %s", self.protocol_name, sheet_url or "(none)")
+
+        # Remove persisted session state (experiment is complete)
+        if self._user_id:
+            from .session_store import delete_session
+            delete_session(self._user_id)
+
         return summary, sheet_url

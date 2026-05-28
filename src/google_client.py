@@ -454,6 +454,23 @@ async def append_experiment_rows(
     await _run(_append_experiment_rows_sync, spreadsheet_id, tab_title, rows)
 
 
+def _read_sheet_rows_sync(spreadsheet_id: str, tab_title: str, max_rows: int = 30) -> list[list[str]]:
+    """Read the last N rows from a tab in a spreadsheet."""
+    svc = _get_service("sheets", "v4")
+    safe_title = tab_title.replace("'", "''")
+    result = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{safe_title}'!A:Z",
+    ).execute()
+    rows = result.get("values", [])
+    return rows[-max_rows:] if len(rows) > max_rows else rows
+
+
+async def read_sheet_rows(spreadsheet_id: str, tab_title: str, max_rows: int = 30) -> list[list[str]]:
+    """Read the last N rows from a spreadsheet tab."""
+    return await _run(_read_sheet_rows_sync, spreadsheet_id, tab_title, max_rows)
+
+
 def get_sheet_url(spreadsheet_id: str, sheet_id: int = 0) -> str:
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet_id}"
 
@@ -825,3 +842,256 @@ async def set_column_widths(
 ) -> None:
     """Set column widths. widths: list of (start_col, end_col, pixel_width)."""
     await _run(_set_column_widths_sync, spreadsheet_id, sheet_id, widths)
+
+
+# ── Drive — database subfolder browsing ───────────────────────────────────────
+
+
+def _find_database_folder_sync(protocol_folder_id: str) -> Optional[str]:
+    """Find the 'database' subfolder inside a protocol folder. Returns folder id or None."""
+    svc = _get_service("drive", "v3")
+    q = (
+        f"'{protocol_folder_id}' in parents"
+        " and mimeType='application/vnd.google-apps.folder'"
+        " and name='database'"
+        " and trashed=false"
+    )
+    result = svc.files().list(q=q, fields="files(id)").execute()
+    files = result.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _list_folder_contents_sync(folder_id: str) -> list[dict]:
+    """List all files and subfolders in a Drive folder.
+
+    Returns list of dicts: {"id", "name", "mimeType", "is_folder"}
+    """
+    svc = _get_service("drive", "v3")
+    q = f"'{folder_id}' in parents and trashed=false"
+    items = []
+    page_token = None
+    while True:
+        result = svc.files().list(
+            q=q,
+            fields="nextPageToken, files(id, name, mimeType)",
+            orderBy="folder,name",
+            pageSize=100,
+            pageToken=page_token,
+        ).execute()
+        for f in result.get("files", []):
+            items.append({
+                "id": f["id"],
+                "name": f["name"],
+                "mimeType": f["mimeType"],
+                "is_folder": f["mimeType"] == "application/vnd.google-apps.folder",
+            })
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+async def list_database_folder(
+    protocol_folder_id: str, subfolder_path: str = ""
+) -> Optional[list[dict]]:
+    """List contents of the database/ subfolder (or a nested path within it).
+
+    Args:
+        protocol_folder_id: The protocol folder ID on Drive.
+        subfolder_path: Optional relative path within database/ (e.g. "samples/day1").
+
+    Returns list of {"id", "name", "mimeType", "is_folder"} or None if not found.
+    """
+    db_folder_id = await _run(_find_database_folder_sync, protocol_folder_id)
+    if not db_folder_id:
+        return None
+
+    # Navigate into subfolder path if specified
+    current_id = db_folder_id
+    if subfolder_path:
+        parts = [p for p in subfolder_path.strip("/").split("/") if p]
+        for part in parts:
+            contents = await _run(_list_folder_contents_sync, current_id)
+            found = None
+            for item in contents:
+                if item["is_folder"] and item["name"].lower() == part.lower():
+                    found = item["id"]
+                    break
+            if not found:
+                return None
+            current_id = found
+
+    return await _run(_list_folder_contents_sync, current_id)
+
+
+def _read_file_content_sync(file_id: str, mime_type: str) -> str:
+    """Read the text content of a file from Drive.
+
+    Supports: Google Docs/Sheets, Office documents (.docx, .doc, .xlsx, .xls,
+    .pptx), PDFs, plain text, CSV/TSV, and images (returns description).
+    """
+    # --- Google native formats (use their APIs) ---
+    if mime_type == "application/vnd.google-apps.document":
+        return _read_doc_sync(file_id)
+
+    if mime_type == "application/vnd.google-apps.spreadsheet":
+        svc = _get_service("sheets", "v4")
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=file_id,
+            range="A:Z",
+        ).execute()
+        rows = result.get("values", [])
+        return "\n".join("\t".join(row) for row in rows)
+
+    if mime_type == "application/vnd.google-apps.presentation":
+        # Export as plain text
+        svc = _get_service("drive", "v3")
+        content = svc.files().export(
+            fileId=file_id, mimeType="text/plain"
+        ).execute()
+        return content.decode("utf-8") if isinstance(content, bytes) else content
+
+    # --- Download binary for everything else ---
+    svc = _get_service("drive", "v3")
+    request = svc.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    raw = buf.getvalue()
+
+    # --- Excel (.xlsx) ---
+    if mime_type in (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheets_text = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                sheets_text.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
+        wb.close()
+        return "\n\n".join(sheets_text) if sheets_text else "[Empty spreadsheet]"
+
+    # --- Legacy Excel (.xls) ---
+    if mime_type == "application/vnd.ms-excel":
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=raw)
+        sheets_text = []
+        for sheet in wb.sheets():
+            rows = []
+            for rx in range(sheet.nrows):
+                cells = [str(sheet.cell_value(rx, cx)) for cx in range(sheet.ncols)]
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                sheets_text.append(f"--- Sheet: {sheet.name} ---\n" + "\n".join(rows))
+        return "\n\n".join(sheets_text) if sheets_text else "[Empty spreadsheet]"
+
+    # --- Word (.docx) ---
+    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        from docx import Document
+        doc = Document(io.BytesIO(raw))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        # Also extract tables
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                paragraphs.append("\t".join(cells))
+        return "\n".join(paragraphs) if paragraphs else "[Empty document]"
+
+    # --- Legacy Word (.doc) ---
+    if mime_type == "application/msword":
+        # Best-effort: extract readable text from binary .doc
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                ["antiword", tmp_path], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+            # Fallback: catdoc
+            result = subprocess.run(
+                ["catdoc", tmp_path], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            import os
+            os.unlink(tmp_path)
+        # Last resort: extract printable strings
+        text = raw.decode("latin-1")
+        # Filter to lines with mostly printable chars
+        lines = []
+        for line in text.split("\n"):
+            printable = sum(1 for c in line if c.isprintable() or c in "\t\r")
+            if len(line) > 0 and printable / len(line) > 0.8:
+                lines.append(line.strip())
+        return "\n".join(lines) if lines else "[Could not extract text from .doc file]"
+
+    # --- PowerPoint (.pptx) ---
+    if mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+        from pptx import Presentation
+        prs = Presentation(io.BytesIO(raw))
+        slides_text = []
+        for i, slide in enumerate(prs.slides, 1):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            texts.append(t)
+            if texts:
+                slides_text.append(f"--- Slide {i} ---\n" + "\n".join(texts))
+        return "\n\n".join(slides_text) if slides_text else "[Empty presentation]"
+
+    # --- PDF ---
+    if mime_type == "application/pdf":
+        import fitz  # pymupdf
+        doc = fitz.open(stream=raw, filetype="pdf")
+        pages_text = []
+        for page in doc:
+            text = page.get_text()
+            if text.strip():
+                pages_text.append(text)
+        doc.close()
+        return "\n\n".join(pages_text) if pages_text else "[Empty or scanned PDF — no extractable text]"
+
+    # --- Images (jpeg, png, bmp, gif, tiff, etc.) ---
+    if mime_type.startswith("image/"):
+        # Can't OCR without tesseract, but report image metadata
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            info = f"[Image: {img.format} {img.size[0]}x{img.size[1]} {img.mode}]"
+            img.close()
+            return info
+        except Exception:
+            return f"[Image file, {len(raw)} bytes — cannot extract text]"
+
+    # --- Plain text fallback ---
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return f"[Binary file, {len(raw)} bytes — cannot display as text]"
+
+
+async def read_database_file(file_id: str, mime_type: str) -> str:
+    """Read a file from the database folder and return its text content."""
+    return await _run(_read_file_content_sync, file_id, mime_type)
